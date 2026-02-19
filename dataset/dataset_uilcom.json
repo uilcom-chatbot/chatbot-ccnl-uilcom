@@ -1,0 +1,866 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-02-19",
+  "notes": "Dataset UILCOM CCNL Grafici Editoria - test di precisione. Le expected sono volutamente conservative: se il CCNL caricato non contiene un dato, la risposta deve dirlo.",
+  "modules": [
+    {
+      "name": "1) Mansioni superiori e passaggio categoria",
+      "tests": [
+        {
+          "id": "MS-01",
+          "question": "Come si passa a una categoria superiore?",
+          "expected": "Spiega che il passaggio/assegnazione definitiva a mansioni superiori scatta dopo un periodo previsto dal CCNL (se presente: 30 giorni continuativi o 60 non continuativi) e che NON si applica in caso di sostituzione di lavoratore assente con diritto alla conservazione del posto. Se nel CCNL caricato non emerge la regola, dichiararlo.",
+          "must_include": ["mansioni superiori", "sostituzione", "conservazione del posto"],
+          "must_not_include": ["tre mesi", "3 mesi (se non nel contesto mansioni superiori)"],
+          "notes": "Test principale 30/60 + esclusione sostituzione."
+        },
+        {
+          "id": "MS-02",
+          "question": "Se sto sostituendo un collega in maternità mi spetta il livello superiore?",
+          "expected": "Deve spiegare che la sostituzione di un lavoratore assente con diritto alla conservazione del posto (maternità) esclude l'applicazione della regola di consolidamento/passaggio definitivo. Può citare il diritto al trattamento economico delle mansioni svolte solo se emerge nel CCNL caricato; altrimenti dire che non emerge.",
+          "must_include": ["maternità", "conservazione del posto", "non si applica"],
+          "must_not_include": ["potresti avere diritto", "promozione automatica"],
+          "notes": "Guardrail anti-risposta vaga."
+        },
+        {
+          "id": "MS-03",
+          "question": "Se invece non è sostituzione ma posto vacante, dopo quanto scatta il livello?",
+          "expected": "Deve distinguere posto vacante vs sostituzione con conservazione posto. Se nel CCNL caricato emerge la soglia 30/60, usare quella. Se emerge un'altra soglia collegata esplicitamente alle mansioni superiori, usare SOLO quella. Se non emerge, dichiararlo.",
+          "must_include": ["posto vacante", "mansioni superiori"],
+          "must_not_include": ["60% (non c'entra)", "percentuali straordinario"],
+          "notes": "Evita usare durate scollegate."
+        },
+        {
+          "id": "MS-04",
+          "question": "L'affiancamento/formazione su un collega di livello più alto vale come mansioni superiori?",
+          "expected": "Deve dire che formazione/addestramento/affiancamento NON costituiscono assegnazione a mansioni superiori se così risulta dal CCNL caricato. Se non emerge, dichiarare che non emerge.",
+          "must_include": ["affiancamento", "formazione", "non costituisce"],
+          "must_not_include": ["vale come passaggio certo", "scatta automaticamente"],
+          "notes": "Test anti-fraintendimento."
+        },
+        {
+          "id": "MS-05",
+          "question": "Mi stanno facendo fare mansioni più alte: cosa succede?",
+          "expected": "Deve spiegare: (1) trattamento economico corrispondente alle mansioni svolte se emerge nel CCNL caricato, (2) regola 30/60 se presente, (3) esclusione sostituzione con conservazione del posto. Se qualche punto non emerge nel CCNL caricato, dichiararlo.",
+          "must_include": ["mansioni superiori"],
+          "must_not_include": ["3 mesi (se non collegato)", "promozione garantita"],
+          "notes": "Risposta strutturata e prudente."
+        },
+        {
+          "id": "MS-06",
+          "question": "Se faccio mansioni superiori in modo discontinuo, come si calcola il termine?",
+          "expected": "Se nel CCNL caricato emerge la regola dei 60 giorni non continuativi, deve riportarla e spiegare che è per periodi non continuativi. Se non emerge, dichiararlo.",
+          "must_include": ["non continuativi"],
+          "must_not_include": ["inventare numeri diversi da 60"],
+          "notes": "Test sulla parte 'discontinuo'."
+        },
+        {
+          "id": "MS-07",
+          "question": "Chi decide il mio livello: mansione o dichiaratoria?",
+          "expected": "Deve dire che l'inquadramento si basa su dichiaratorie/profili professionali e mansioni effettivamente svolte, SOLO se emerge nel CCNL caricato. Altrimenti: non ho trovato nel CCNL caricato.",
+          "must_include": ["inquadramento", "mansioni"],
+          "must_not_include": ["citare pagine al pubblico"],
+          "notes": "Test su regola inquadramento."
+        },
+        {
+          "id": "MS-08",
+          "question": "Serve un ordine di servizio scritto per il riconoscimento di mansioni superiori?",
+          "expected": "Deve rispondere senza inventare: se nel CCNL caricato parla di ordine di servizio/assegnazione scritta, dirlo; altrimenti dire che non emerge. Consiglio pratico: chiedere conferma scritta/ODS e confronto con RSU/HR.",
+          "must_include": ["ordine di servizio"],
+          "must_not_include": ["obbligatorio per legge (senza fonte)"],
+          "notes": "Qui conta la prudenza."
+        },
+        {
+          "id": "MS-09",
+          "question": "Se torno alle mansioni precedenti, perdo il livello?",
+          "expected": "Deve evitare invenzioni. Se nel CCNL caricato emerge conservazione livello o trattamento, dirlo; altrimenti dichiarare che non emerge. Se la domanda è ambigua, rispondere con cautela e suggerire RSU/HR.",
+          "must_include": ["se non emerge", "RSU"],
+          "must_not_include": ["perdi sempre", "mantieni sempre (senza contesto)"],
+          "notes": "Test anti-assolutismi."
+        },
+        {
+          "id": "MS-10",
+          "question": "La sostituzione per malattia lunga vale come maternità ai fini del livello?",
+          "expected": "Deve ricondurre al concetto: sostituzione di assente con diritto alla conservazione del posto → esclusione della regola di consolidamento, se emerge nel CCNL caricato. Non deve inventare dettagli su 'malattia lunga' se non nel CCNL caricato.",
+          "must_include": ["sostituzione", "conservazione del posto"],
+          "must_not_include": ["30/60 se non trovato nei chunk", "promozione automatica"],
+          "notes": "Test di generalizzazione: conservazione posto."
+        }
+      ]
+    },
+
+    {
+      "name": "2) Permessi retribuiti (inclusi ROL e festività soppresse)",
+      "tests": [
+        {
+          "id": "PR-01",
+          "question": "Quali permessi retribuiti ha a disposizione un lavoratore?",
+          "expected": "Deve elencare SOLO le tipologie che trova nel CCNL caricato (es. assemblea sindacale, diritto allo studio, ROL/festività soppresse se presenti, ecc.). Se non emergono 'tutti', deve dirlo chiaramente.",
+          "must_include": ["solo se presenti nel CCNL caricato"],
+          "must_not_include": ["legge 104 (se non trovata)", "visite mediche (se non trovate)"],
+          "notes": "Test anti-elenco inventato."
+        },
+        {
+          "id": "PR-02",
+          "question": "Elencami tutti i permessi retribuiti inclusi i ROL ed ex festività",
+          "expected": "Deve gestire la terminologia: 'ex festività' → nel CCNL potrebbe comparire come festività soppresse/abolite/infrasettimanali abolite. Deve includere ROL e festività abolite solo se nel contesto recuperato compaiono. Non deve confondere con permessi studio.",
+          "must_include": ["ROL", "festività soppresse", "terminologia equivalente"],
+          "must_not_include": ["inventare 'ex festività' se non presente", "aggiungere categorie senza evidenza"],
+          "notes": "Test sul mapping ex festività."
+        },
+        {
+          "id": "PR-03",
+          "question": "Quanti ROL spettano e come si usano?",
+          "expected": "Se nel CCNL caricato emerge un monte ore/giorni ROL, riportarlo. Se non emerge, dirlo. Spiegare modalità di fruizione solo se presente (preavviso/programmazione/regole aziendali).",
+          "must_include": ["se non emerge, dichiararlo"],
+          "must_not_include": ["numeri inventati (es. 4 giornate) se non nel CCNL"],
+          "notes": "Evita numeri a caso."
+        },
+        {
+          "id": "PR-04",
+          "question": "Quante ex festività spettano?",
+          "expected": "Deve spiegare che nel CCNL potrebbe non chiamarle 'ex festività' ma 'festività soppresse/abolite'. Se nel contesto recuperato manca un numero, deve dire che non emerge dal CCNL caricato.",
+          "must_include": ["festività soppresse/abolite"],
+          "must_not_include": ["4 giornate (se non trovato)"],
+          "notes": "Guardrail numeri."
+        },
+        {
+          "id": "PR-05",
+          "question": "Permessi per lutto: quanti giorni e per quali familiari?",
+          "expected": "Se nel CCNL caricato emergono giorni e familiari, riportarli. Se emerge solo la retribuzione o solo la voce generica, dirlo. Non inventare elenco familiari.",
+          "must_include": ["non inventare familiari"],
+          "must_not_include": ["coniuge/genitori/figli ecc. se non nel CCNL"],
+          "notes": "Importantissimo per evitare invenzioni."
+        },
+        {
+          "id": "PR-06",
+          "question": "Permessi per visite mediche: sono retribuiti? serve giustificativo?",
+          "expected": "Deve rispondere SOLO se trova nel CCNL caricato regole su giustificativi/assenze giustificate. Non confondere con assemblee sindacali. Se non emerge, dichiararlo.",
+          "must_include": ["giustificativo", "se non emerge"],
+          "must_not_include": ["pag. 32 al pubblico", "inventare limiti ore"],
+          "notes": "Il tuo PDF aveva pag.32 su assemblee: evitare errore."
+        },
+        {
+          "id": "PR-07",
+          "question": "Diritto allo studio: quante ore e come si richiedono?",
+          "expected": "Se nel CCNL caricato emerge '150 ore' e le condizioni (percentuali, richiesta scritta, limiti), riportare. Se manca, dire che non emerge.",
+          "must_include": ["150 ore (solo se presente)", "richiesta"],
+          "must_not_include": ["inventare percentuali 2,5% se non trovato nel contesto selezionato"],
+          "notes": "Test su studio."
+        },
+        {
+          "id": "PR-08",
+          "question": "Permessi sindacali e assemblea: quante ore retribuite spettano?",
+          "expected": "Se il CCNL caricato riporta ore annue e distinzioni (aziende <16 ecc.), riportare. Se non emerge, dichiararlo.",
+          "must_include": ["assemblea", "ore (solo se presenti)"],
+          "must_not_include": ["numeri inventati"],
+          "notes": "Stabilità su assemblee."
+        },
+        {
+          "id": "PR-09",
+          "question": "ROL e festività soppresse: sono la stessa cosa?",
+          "expected": "Deve spiegare con cautela: se nel CCNL caricato descrive riposi/permessi in sostituzione festività abolite e/o ROL, chiarire cosa è presente. Se manca, dichiararlo.",
+          "must_include": ["termini presenti nel CCNL"],
+          "must_not_include": ["definizioni assolute senza fonte"],
+          "notes": "Test concettuale."
+        },
+        {
+          "id": "PR-10",
+          "question": "Esistono permessi retribuiti per donazione sangue nel CCNL?",
+          "expected": "Deve rispondere SOLO se nel CCNL caricato compare donazione sangue/emocomponenti. Se non emerge, dire che non emerge.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["sì certo (senza evidenza)"],
+          "notes": "Anti-invenzione."
+        }
+      ]
+    },
+
+    {
+      "name": "3) Malattia (super precisione)",
+      "tests": [
+        {
+          "id": "MA-01",
+          "question": "Quanto mi pagano in malattia?",
+          "expected": "Deve riportare SOLO percentuali/periodi se presenti nel CCNL caricato. Deve distinguere integrazione azienda/INPS solo se emerge nel contesto. Se non trova percentuali e durata, deve dire 'Non ho trovato la risposta nel CCNL caricato'.",
+          "must_include": ["se non emerge, dichiararlo"],
+          "must_not_include": ["100% 180 giorni (se non trovato)", "50% 6 mesi (se non trovato)"],
+          "notes": "Test contro numeri inventati."
+        },
+        {
+          "id": "MA-02",
+          "question": "Qual è il periodo di comporto in malattia?",
+          "expected": "Deve rispondere SOLO se nel CCNL caricato emerge il periodo massimo e la regola di conteggio. Se manca, dichiararlo.",
+          "must_include": ["comporto"],
+          "must_not_include": ["12 mesi (se non trovato)", "regole doppio conteggio (se non trovato)"],
+          "notes": "Molti errori qui: no invenzioni."
+        },
+        {
+          "id": "MA-03",
+          "question": "Entro quando devo inviare il certificato di malattia?",
+          "expected": "Se nel CCNL caricato emerge obbligo comunicazione e invio certificato entro un termine, riportarlo. Se non emerge, dichiararlo.",
+          "must_include": ["certificato", "comunicazione"],
+          "must_not_include": ["entro 2 giorni (se non trovato)"],
+          "notes": "Evita numeri senza evidenza."
+        },
+        {
+          "id": "MA-04",
+          "question": "Ci sono fasce di reperibilità o visite fiscali nel CCNL?",
+          "expected": "Deve dire cosa emerge dal CCNL caricato. Se non ci sono dettagli, deve dirlo e non inventare fasce orarie.",
+          "must_include": ["visita fiscale (se presente) o 'non emerge'"],
+          "must_not_include": ["9-13 e 15-18 (senza fonte)"],
+          "notes": "Mai inventare fasce."
+        },
+        {
+          "id": "MA-05",
+          "question": "Se mi ammalo durante le ferie, cosa succede?",
+          "expected": "Deve rispondere SOLO se nel CCNL caricato contiene regola 'malattia durante ferie'. Se non emerge, dichiararlo.",
+          "must_include": ["ferie", "malattia"],
+          "must_not_include": ["si interrompono sempre (senza fonte)"],
+          "notes": "Tema frequente."
+        },
+        {
+          "id": "MA-06",
+          "question": "Infortunio sul lavoro: cambia la retribuzione rispetto alla malattia?",
+          "expected": "Se nel CCNL caricato tratta infortunio e integrazione, riportare. Se non emerge, dirlo.",
+          "must_include": ["infortunio"],
+          "must_not_include": ["percentuali inventate"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "MA-07",
+          "question": "Cos'è la ricaduta e come si calcola ai fini del comporto?",
+          "expected": "Deve parlare di ricaduta solo se appare nel CCNL caricato. Altrimenti: non emerge.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["definizioni INPS generiche spacciate per CCNL"],
+          "notes": "No normative esterne."
+        },
+        {
+          "id": "MA-08",
+          "question": "Il CCNL prevede conservazione del posto in malattia?",
+          "expected": "Se nel CCNL caricato compare conservazione posto per malattia, riportare durata e condizioni solo se presenti. Se non emerge, dichiararlo.",
+          "must_include": ["conservazione del posto (se presente) o 'non emerge'"],
+          "must_not_include": ["durate inventate"],
+          "notes": "Evita stime."
+        },
+        {
+          "id": "MA-09",
+          "question": "Malattia: c'è una integrazione aziendale della retribuzione?",
+          "expected": "Deve dire se nel CCNL caricato l'azienda integra il trattamento mutualistico/infortunistico. Se non emerge, dichiararlo.",
+          "must_include": ["integrazione (se presente) o 'non emerge'"],
+          "must_not_include": ["7% fisso (se non trovato)"],
+          "notes": "Il tuo PDF mostrava frase 'integra' in un estratto: qui serve evidenza."
+        },
+        {
+          "id": "MA-10",
+          "question": "Esistono giorni di carenza o regole particolari per assenze brevi (1-3 giorni)?",
+          "expected": "Deve riportare regole su assenze brevi solo se presenti nel CCNL caricato. Se non emerge, dirlo.",
+          "must_include": ["assenze brevi (se presente) o 'non emerge'"],
+          "must_not_include": ["conteggio doppio (se non trovato)"],
+          "notes": "Anti-invenzione."
+        }
+      ]
+    },
+
+    {
+      "name": "4) Ferie (super precisione)",
+      "tests": [
+        {
+          "id": "FE-01",
+          "question": "Quante ferie ha a disposizione un operaio in un anno?",
+          "expected": "Se nel CCNL caricato c'è il numero giorni/ore ferie annue, riportarlo. Se non emerge, deve dire: 'Non ho trovato la risposta nel CCNL caricato.'",
+          "must_include": ["se non emerge, dichiararlo"],
+          "must_not_include": ["26 giorni (se non trovato)", "4 settimane (se non trovato)"],
+          "notes": "Test che ti ha dato risposta vuota: qui deve essere prudente."
+        },
+        {
+          "id": "FE-02",
+          "question": "Le ferie maturano mensilmente o annualmente?",
+          "expected": "Rispondere solo se il CCNL caricato descrive la maturazione. Se non emerge, dichiararlo.",
+          "must_include": ["maturazione (se presente) o 'non emerge'"],
+          "must_not_include": ["matura sempre 1/12 (senza fonte)"],
+          "notes": "No norme generali."
+        },
+        {
+          "id": "FE-03",
+          "question": "Posso chiedere ferie a ore o solo a giorni?",
+          "expected": "Se nel CCNL caricato è prevista fruizione a ore/giorni, riportarlo. Se non emerge, dichiararlo.",
+          "must_include": ["fruizione"],
+          "must_not_include": ["sempre a ore (senza fonte)"],
+          "notes": "Ambiguo: prudenza."
+        },
+        {
+          "id": "FE-04",
+          "question": "Chi decide il periodo di ferie, io o l'azienda?",
+          "expected": "Se il CCNL caricato disciplina programmazione/turnazione ferie, riportare. Se non emerge, dichiarare che non emerge.",
+          "must_include": ["programmazione (se presente) o 'non emerge'"],
+          "must_not_include": ["decide sempre l'azienda (senza fonte)"],
+          "notes": "Evita assoluti."
+        },
+        {
+          "id": "FE-05",
+          "question": "Entro quando vanno consumate le ferie residue?",
+          "expected": "Rispondere solo se il CCNL caricato prevede termini. Se non emerge, dirlo.",
+          "must_include": ["residui (se presente) o 'non emerge'"],
+          "must_not_include": ["entro 18 mesi (senza fonte)"],
+          "notes": "No norme esterne."
+        },
+        {
+          "id": "FE-06",
+          "question": "Le ferie si possono monetizzare?",
+          "expected": "Solo se il CCNL caricato prevede monetizzazione. Se non emerge, dirlo.",
+          "must_include": ["monetizzazione (se presente) o 'non emerge'"],
+          "must_not_include": ["si può sempre (senza fonte)"],
+          "notes": "Tema delicato."
+        },
+        {
+          "id": "FE-07",
+          "question": "Se l'azienda chiude, posso essere obbligato a mettere ferie?",
+          "expected": "Rispondere solo se nel CCNL caricato emerge chiusura collettiva/ferie collettive. Se non emerge, dichiararlo.",
+          "must_include": ["chiusura (se presente) o 'non emerge'"],
+          "must_not_include": ["sì sempre (senza fonte)"],
+          "notes": "No assoluti."
+        },
+        {
+          "id": "FE-08",
+          "question": "Ferie e permessi: qual è la differenza?",
+          "expected": "Risposta concettuale solo se nel CCNL caricato distingue. Se non emerge, dire che non emerge e rispondere in modo minimale senza inventare definizioni specifiche.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["definizioni legali esterne"],
+          "notes": "Prudenza massima."
+        },
+        {
+          "id": "FE-09",
+          "question": "Posso frazionare le ferie in più periodi nell'anno?",
+          "expected": "Rispondere solo se il CCNL caricato parla di frazionamento. Se non emerge, dirlo.",
+          "must_include": ["frazionamento (se presente) o 'non emerge'"],
+          "must_not_include": ["sempre sì/no (senza fonte)"],
+          "notes": "No assoluti."
+        },
+        {
+          "id": "FE-10",
+          "question": "Le ferie incidono su tredicesima/quattordicesima?",
+          "expected": "Rispondere solo se nel CCNL caricato collega ferie a trattamenti economici. Se non emerge, dichiararlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["sì/no certo (senza fonte)"],
+          "notes": "Tema stipendiale: prudenza."
+        }
+      ]
+    },
+
+    {
+      "name": "5) Straordinari (super precisione)",
+      "tests": [
+        {
+          "id": "ST-01",
+          "question": "Quanto viene pagato lo straordinario?",
+          "expected": "Deve riportare SOLO percentuali/maggiorazioni se presenti nel CCNL caricato. Se non trova percentuali, deve dire che non emerge.",
+          "must_include": ["straordinario", "maggiorazione (se presente) o 'non emerge'"],
+          "must_not_include": ["percentuali inventate"],
+          "notes": "Base straordinario."
+        },
+        {
+          "id": "ST-02",
+          "question": "Quanto viene pagato lo straordinario notturno?",
+          "expected": "Deve distinguere chiaramente straordinario notturno e usare SOLO la percentuale del CCNL caricato. Non deve applicare la percentuale dello straordinario notturno al notturno ordinario.",
+          "must_include": ["straordinario notturno"],
+          "must_not_include": ["confondere con notturno ordinario"],
+          "notes": "Guardrail principale."
+        },
+        {
+          "id": "ST-03",
+          "question": "Quanto viene pagato il lavoro festivo?",
+          "expected": "Se il CCNL caricato riporta maggiorazioni per festivo, riportarle. Se non emerge, dirlo.",
+          "must_include": ["festivo"],
+          "must_not_include": ["numeri inventati"],
+          "notes": "Festivo."
+        },
+        {
+          "id": "ST-04",
+          "question": "Serve autorizzazione per fare straordinari?",
+          "expected": "Rispondere solo se il CCNL caricato parla di autorizzazione/necessità. Se non emerge, dirlo.",
+          "must_include": ["autorizzazione (se presente) o 'non emerge'"],
+          "must_not_include": ["sempre obbligatoria (senza fonte)"],
+          "notes": "Processo."
+        },
+        {
+          "id": "ST-05",
+          "question": "Ci sono limiti massimi di ore di straordinario?",
+          "expected": "Se nel CCNL caricato ci sono limiti numerici, riportarli. Se non emergono, dirlo.",
+          "must_include": ["limiti (se presenti) o 'non emerge'"],
+          "must_not_include": ["250 ore/anno (senza fonte)"],
+          "notes": "No numeri esterni."
+        },
+        {
+          "id": "ST-06",
+          "question": "Straordinario: si può recuperare con riposi/banca ore?",
+          "expected": "Rispondere solo se il CCNL caricato tratta recupero/banca ore. Se non emerge, dirlo.",
+          "must_include": ["recupero (se presente) o 'non emerge'"],
+          "must_not_include": ["banca ore sempre prevista (senza fonte)"],
+          "notes": "Tema comune."
+        },
+        {
+          "id": "ST-07",
+          "question": "Se lavoro di notte ma in orario normale, è straordinario?",
+          "expected": "Deve chiarire differenza tra notturno ordinario e straordinario, senza inventare. Se il CCNL caricato definisce, riportare; altrimenti dirlo.",
+          "must_include": ["notturno ordinario vs straordinario"],
+          "must_not_include": ["automaticamente straordinario (senza fonte)"],
+          "notes": "Concettuale."
+        },
+        {
+          "id": "ST-08",
+          "question": "Lo straordinario incide su tredicesima/quattordicesima?",
+          "expected": "Rispondere solo se nel CCNL caricato disciplina incidenza su mensilità aggiuntive. Se non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["sì sempre/no sempre (senza fonte)"],
+          "notes": "Economico."
+        },
+        {
+          "id": "ST-09",
+          "question": "Straordinario: come viene calcolata la base oraria?",
+          "expected": "Se nel CCNL caricato c'è formula di calcolo, riportarla. Se non emerge, dirlo.",
+          "must_include": ["base oraria (se presente) o 'non emerge'"],
+          "must_not_include": ["dividi per 173 (senza fonte)"],
+          "notes": "No formule esterne."
+        },
+        {
+          "id": "ST-10",
+          "question": "Se faccio straordinario in giorno di riposo, cambia la maggiorazione?",
+          "expected": "Rispondere solo se nel CCNL caricato distingue riposo/turno/straordinario. Se non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["maggiorazione certa senza fonte"],
+          "notes": "Turni."
+        }
+      ]
+    },
+
+    {
+      "name": "6) Lavoro notturno (ordinario) - super precisione",
+      "tests": [
+        {
+          "id": "NO-01",
+          "question": "Quanto viene pagato il lavoro notturno?",
+          "expected": "Deve rispondere SOLO con regole del lavoro notturno ordinario se presenti nel CCNL caricato. Se nel contesto recuperato trova solo 'straordinario notturno', deve dirlo e NON applicarlo al notturno ordinario.",
+          "must_include": ["notturno", "ordinario", "se non emerge"],
+          "must_not_include": ["60% (se è solo straordinario notturno)"],
+          "notes": "Questo è il tuo bug storico."
+        },
+        {
+          "id": "NO-02",
+          "question": "Il notturno ordinario ha una maggiorazione fissa?",
+          "expected": "Se nel CCNL caricato c'è percentuale, riportarla. Se non emerge, dirlo.",
+          "must_include": ["maggiorazione (se presente) o 'non emerge'"],
+          "must_not_include": ["percentuali inventate"],
+          "notes": "No invenzioni."
+        },
+        {
+          "id": "NO-03",
+          "question": "Cos'è considerato lavoro notturno nel CCNL?",
+          "expected": "Se il CCNL caricato definisce fasce orarie o definizione, riportarla. Se non emerge, dire che non emerge e non inventare fasce.",
+          "must_include": ["definizione (se presente) o 'non emerge'"],
+          "must_not_include": ["22-6 (senza fonte)"],
+          "notes": "Mai inventare fasce."
+        },
+        {
+          "id": "NO-04",
+          "question": "Notturno: ci sono limitazioni o tutele particolari?",
+          "expected": "Rispondere solo se CCNL caricato contiene limitazioni/tutele. Se non emerge, dirlo.",
+          "must_include": ["tutele (se presenti) o 'non emerge'"],
+          "must_not_include": ["norme salute esterne"],
+          "notes": "No normative esterne."
+        },
+        {
+          "id": "NO-05",
+          "question": "Se faccio notte e poi mattina, c'è riposo minimo?",
+          "expected": "Rispondere solo se nel CCNL caricato c'è riposo minimo. Se non emerge, dirlo.",
+          "must_include": ["riposo (se presente) o 'non emerge'"],
+          "must_not_include": ["11 ore sempre (senza fonte)"],
+          "notes": "No leggi esterne."
+        },
+        {
+          "id": "NO-06",
+          "question": "Il notturno incide sulla paga base o è solo maggiorazione?",
+          "expected": "Risposta prudente: se CCNL caricato parla di maggiorazione, dirlo. Se non emerge, dirlo.",
+          "must_include": ["maggiorazione"],
+          "must_not_include": ["incide sempre sulla base (senza fonte)"],
+          "notes": "Economico."
+        },
+        {
+          "id": "NO-07",
+          "question": "Lavoro notturno in festivo: che maggiorazione vale?",
+          "expected": "Rispondere solo se nel CCNL caricato prevede cumulo o regola specifica. Se non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["somma percentuali (senza fonte)"],
+          "notes": "Tema complicato."
+        },
+        {
+          "id": "NO-08",
+          "question": "Notturno: esiste indennità oltre alla maggiorazione?",
+          "expected": "Rispondere solo se CCNL caricato parla di indennità notturna. Se non emerge, dirlo.",
+          "must_include": ["indennità (se presente) o 'non emerge'"],
+          "must_not_include": ["sì sempre (senza fonte)"],
+          "notes": "No invenzioni."
+        },
+        {
+          "id": "NO-09",
+          "question": "Lavoro notturno: è previsto un limite di turni?",
+          "expected": "Rispondere solo se CCNL caricato dà limiti. Se non emerge, dirlo.",
+          "must_include": ["limite (se presente) o 'non emerge'"],
+          "must_not_include": ["massimo 7 notti (senza fonte)"],
+          "notes": "No regole esterne."
+        },
+        {
+          "id": "NO-10",
+          "question": "Notturno: come faccio a verificare in busta paga?",
+          "expected": "Risposta pratica senza inventare norme: suggerire di cercare voci 'notturno'/'maggiorazione notturna' e confrontare con accordi aziendali se rilevante.",
+          "must_include": ["busta paga"],
+          "must_not_include": ["indicazioni di importi esatti senza fonte"],
+          "notes": "Consiglio pratico."
+        }
+      ]
+    },
+
+    {
+      "name": "7) Inquadramento, livelli, declaratorie",
+      "tests": [
+        {
+          "id": "IN-01",
+          "question": "Come funziona l'inquadramento nel CCNL?",
+          "expected": "Deve dire che l'inquadramento si basa su declaratorie/profili e mansioni effettive solo se emerge nel CCNL caricato. Se non emerge, dichiararlo.",
+          "must_include": ["inquadramento"],
+          "must_not_include": ["citare pagine al pubblico"],
+          "notes": "Fondamentale."
+        },
+        {
+          "id": "IN-02",
+          "question": "Dove trovo la descrizione del mio livello?",
+          "expected": "Risposta prudente: se nel CCNL caricato sono presenti sezioni su classificazione/levels, dire che va consultata la parte di classificazione professionale. Se non emerge, dirlo.",
+          "must_include": ["classificazione"],
+          "must_not_include": ["pagina precisa al pubblico"],
+          "notes": "Niente pagine al pubblico."
+        },
+        {
+          "id": "IN-03",
+          "question": "Se faccio mansioni di livello più alto, posso chiedere adeguamento?",
+          "expected": "Deve collegarsi al modulo mansioni superiori e alle regole che emergono. Niente invenzioni.",
+          "must_include": ["mansioni superiori"],
+          "must_not_include": ["sì sempre"],
+          "notes": "Cross-modulo."
+        },
+        {
+          "id": "IN-04",
+          "question": "Qual è la differenza tra categoria e livello?",
+          "expected": "Se nel CCNL caricato definisce, riportare. Se non emerge, dichiararlo e rispondere in modo minimo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["definizioni legali esterne"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "IN-05",
+          "question": "L'azienda può abbassarmi il livello se cambio mansioni?",
+          "expected": "Rispondere solo se nel CCNL caricato disciplina demansionamento/conservazione livello. Se non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["non può mai (senza fonte)", "può sempre (senza fonte)"],
+          "notes": "No assoluti."
+        },
+        {
+          "id": "IN-06",
+          "question": "Che differenza paga c'è tra C1 e livello superiore?",
+          "expected": "Se nel CCNL caricato non contiene tabelle retributive/valori, deve dire che non emerge. Se contiene minimi/indennità, riportare solo ciò che trova.",
+          "must_include": ["se non emerge, dichiararlo"],
+          "must_not_include": ["importi inventati"],
+          "notes": "Questo è il tuo upgrade 'differenza paga'."
+        },
+        {
+          "id": "IN-07",
+          "question": "Ci sono scatti di anzianità nel CCNL?",
+          "expected": "Rispondere solo se CCNL caricato parla di scatti/anzianità. Se non emerge, dirlo.",
+          "must_include": ["anzianità (se presente) o 'non emerge'"],
+          "must_not_include": ["scatti automatici ogni 2 anni (senza fonte)"],
+          "notes": "No generalizzazioni."
+        },
+        {
+          "id": "IN-08",
+          "question": "Quali sono i profili professionali previsti?",
+          "expected": "Deve dire che nel CCNL esiste sezione profili solo se nel contesto recuperato emerge. Se non emerge, dirlo.",
+          "must_include": ["profili (se presenti) o 'non emerge'"],
+          "must_not_include": ["liste inventate"],
+          "notes": "No elenchi senza evidenza."
+        },
+        {
+          "id": "IN-09",
+          "question": "Come faccio a contestare un inquadramento errato?",
+          "expected": "Risposta prudente e pratica: suggerire confronto con RSU/UILCOM e HR; niente procedure legali inventate se non nel CCNL caricato.",
+          "must_include": ["RSU", "HR"],
+          "must_not_include": ["diffida legale obbligatoria (senza fonte)"],
+          "notes": "Consiglio pratico."
+        },
+        {
+          "id": "IN-10",
+          "question": "Il CCNL prevede periodi di prova diversi per livello?",
+          "expected": "Rispondere solo se nel CCNL caricato ci sono periodi di prova per livelli. Se non emerge, dirlo.",
+          "must_include": ["periodo di prova (se presente) o 'non emerge'"],
+          "must_not_include": ["durate inventate"],
+          "notes": "No invenzioni."
+        }
+      ]
+    },
+
+    {
+      "name": "8) Orario di lavoro, turni, riposi",
+      "tests": [
+        {
+          "id": "OR-01",
+          "question": "Qual è l'orario di lavoro settimanale previsto dal CCNL?",
+          "expected": "Se nel CCNL caricato è presente l'orario normale, riportarlo. Se non emerge, dirlo.",
+          "must_include": ["orario normale (se presente) o 'non emerge'"],
+          "must_not_include": ["40 ore (senza fonte)"],
+          "notes": "No numeri esterni."
+        },
+        {
+          "id": "OR-02",
+          "question": "Come funzionano i turni e i riposi?",
+          "expected": "Rispondere solo con ciò che emerge nel CCNL caricato. Se manca dettaglio, dirlo e suggerire accordi aziendali IPZS.",
+          "must_include": ["accordi aziendali"],
+          "must_not_include": ["regole IPZS inventate"],
+          "notes": "IPZS spesso ha prassi aziendali."
+        },
+        {
+          "id": "OR-03",
+          "question": "Esiste pausa mensa obbligatoria?",
+          "expected": "Rispondere solo se nel CCNL caricato disciplina pause. Se non emerge, dirlo.",
+          "must_include": ["pausa (se presente) o 'non emerge'"],
+          "must_not_include": ["30 minuti sempre (senza fonte)"],
+          "notes": "No standard inventati."
+        },
+        {
+          "id": "OR-04",
+          "question": "Lavoro supplementare: cos'è e come si paga?",
+          "expected": "Rispondere solo se nel CCNL caricato tratta lavoro supplementare. Se non emerge, dirlo.",
+          "must_include": ["supplementare (se presente) o 'non emerge'"],
+          "must_not_include": ["percentuali inventate"],
+          "notes": "Molti confondono con straordinario."
+        },
+        {
+          "id": "OR-05",
+          "question": "Riposo settimanale: cosa prevede il CCNL?",
+          "expected": "Rispondere solo se nel CCNL caricato c'è disciplina riposo settimanale. Se non emerge, dirlo.",
+          "must_include": ["riposo settimanale (se presente) o 'non emerge'"],
+          "must_not_include": ["sempre domenica (senza fonte)"],
+          "notes": "Turni possono cambiare."
+        },
+        {
+          "id": "OR-06",
+          "question": "Cambio turno: quanto preavviso serve?",
+          "expected": "Rispondere solo se nel CCNL caricato indica preavviso. Se non emerge, dirlo e suggerire accordi aziendali.",
+          "must_include": ["preavviso (se presente) o 'non emerge'", "accordi aziendali"],
+          "must_not_include": ["48 ore (senza fonte)"],
+          "notes": "Tema tipico IPZS."
+        },
+        {
+          "id": "OR-07",
+          "question": "Posso rifiutare un cambio turno?",
+          "expected": "Risposta prudente: se CCNL caricato non disciplina, dirlo e suggerire RSU/HR; niente consigli legali.",
+          "must_include": ["RSU", "HR", "se non emerge"],
+          "must_not_include": ["puoi sempre", "non puoi mai"],
+          "notes": "No assoluti."
+        },
+        {
+          "id": "OR-08",
+          "question": "Orario notturno: è previsto un limite di ore consecutive?",
+          "expected": "Rispondere solo se nel CCNL caricato prevede limiti. Se non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["8 ore massimo (senza fonte)"],
+          "notes": "No leggi esterne."
+        },
+        {
+          "id": "OR-09",
+          "question": "Rientri pomeridiani: sono previsti dal CCNL?",
+          "expected": "Rispondere solo se nel CCNL caricato parla di articolazioni orario. Se non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["sì sempre"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "OR-10",
+          "question": "Riposi compensativi: quando spettano?",
+          "expected": "Rispondere solo se nel CCNL caricato parla di riposi compensativi. Se non emerge, dirlo.",
+          "must_include": ["riposi compensativi (se presenti) o 'non emerge'"],
+          "must_not_include": ["spettano sempre per ogni straordinario (senza fonte)"],
+          "notes": "No generalizzazioni."
+        }
+      ]
+    },
+
+    {
+      "name": "9) Congedi (maternità/paternità/parentale) e permessi legati",
+      "tests": [
+        {
+          "id": "CO-01",
+          "question": "Il CCNL prevede tutele specifiche per maternità oltre alla legge?",
+          "expected": "Deve rispondere SOLO se nel CCNL caricato ci sono clausole specifiche. Se non emerge, dirlo.",
+          "must_include": ["maternità", "se non emerge"],
+          "must_not_include": ["tutele extra certe senza fonte"],
+          "notes": "No norme esterne."
+        },
+        {
+          "id": "CO-02",
+          "question": "Congedo parentale: il CCNL dice qualcosa su integrazioni economiche?",
+          "expected": "Rispondere solo se nel CCNL caricato emergono integrazioni. Se non emerge, dirlo.",
+          "must_include": ["parentale", "se non emerge"],
+          "must_not_include": ["30% sempre", "integrazione 100% (senza fonte)"],
+          "notes": "Tema delicato."
+        },
+        {
+          "id": "CO-03",
+          "question": "Posso prendere congedo parentale contemporaneamente a mia moglie?",
+          "expected": "Se nel CCNL caricato non disciplina, dire che non emerge e suggerire che la regola è di legge/INPS ma qui l'assistente risponde solo dal CCNL.",
+          "must_include": ["non emerge nel CCNL caricato"],
+          "must_not_include": ["sì/no certo (senza fonte CCNL)"],
+          "notes": "Qui deve dire 'non emerge'."
+        },
+        {
+          "id": "CO-04",
+          "question": "Paternità: esiste nel CCNL un congedo aggiuntivo?",
+          "expected": "Rispondere solo se nel CCNL caricato c'è. Se non emerge, dirlo.",
+          "must_include": ["paternità", "se non emerge"],
+          "must_not_include": ["10 giorni (senza fonte CCNL)"],
+          "notes": "No legge esterna."
+        },
+        {
+          "id": "CO-05",
+          "question": "Gravidanza/puerperio: cosa prevede il CCNL sul trattamento economico?",
+          "expected": "Se nel CCNL caricato emerge integrazione durante gravidanza/puerperio, riportare. Se non emerge, dirlo.",
+          "must_include": ["gravidanza", "puerperio"],
+          "must_not_include": ["percentuali inventate"],
+          "notes": "Allineato ai tuoi estratti."
+        },
+        {
+          "id": "CO-06",
+          "question": "Congedo matrimoniale: quanti giorni e come viene pagato?",
+          "expected": "Rispondere solo se nel CCNL caricato indica giorni e retribuzione. Se non emerge, dirlo.",
+          "must_include": ["matrimoniale"],
+          "must_not_include": ["15 giorni (senza fonte CCNL)"],
+          "notes": "No standard esterni."
+        },
+        {
+          "id": "CO-07",
+          "question": "Aspettativa non retribuita: è prevista dal CCNL?",
+          "expected": "Rispondere solo se nel CCNL caricato parla di aspettativa. Se non emerge, dirlo.",
+          "must_include": ["aspettativa (se presente) o 'non emerge'"],
+          "must_not_include": ["sì sempre"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "CO-08",
+          "question": "Permessi per allattamento: sono nel CCNL?",
+          "expected": "Rispondere solo se nel CCNL caricato li tratta. Se non emerge, dirlo (è tipicamente legge).",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["2 ore sempre (senza fonte CCNL)"],
+          "notes": "No legge esterna."
+        },
+        {
+          "id": "CO-09",
+          "question": "Congedo per lutto e congedo matrimoniale: differenze?",
+          "expected": "Rispondere solo con quanto emerge dal CCNL caricato. Se una delle due voci non emerge, dirlo.",
+          "must_include": ["se non emerge"],
+          "must_not_include": ["giorni inventati"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "CO-10",
+          "question": "La maternità conta come 'conservazione del posto' ai fini mansioni superiori?",
+          "expected": "Deve collegare: maternità = assenza con diritto alla conservazione del posto → esclusione consolidamento mansioni superiori, se emerge nel CCNL caricato.",
+          "must_include": ["conservazione del posto", "maternità", "non si applica"],
+          "must_not_include": ["promozione automatica"],
+          "notes": "Cross con mansioni."
+        }
+      ]
+    },
+
+    {
+      "name": "10) Disciplina, sanzioni, procedure e diritti sindacali",
+      "tests": [
+        {
+          "id": "DI-01",
+          "question": "Quali sanzioni disciplinari prevede il CCNL?",
+          "expected": "Rispondere solo se il CCNL caricato contiene elenco sanzioni e procedure. Se non emerge, dirlo.",
+          "must_include": ["disciplinari (se presenti) o 'non emerge'"],
+          "must_not_include": ["licenziamento immediato sempre (senza fonte)"],
+          "notes": "No invenzioni."
+        },
+        {
+          "id": "DI-02",
+          "question": "Come funziona la contestazione disciplinare?",
+          "expected": "Rispondere solo se nel CCNL caricato emergono tempi/modalità. Se non emerge, dirlo.",
+          "must_include": ["contestazione (se presente) o 'non emerge'"],
+          "must_not_include": ["5 giorni (senza fonte)"],
+          "notes": "No standard esterni."
+        },
+        {
+          "id": "DI-03",
+          "question": "Ho diritto a farmi assistere dal sindacato in caso disciplinare?",
+          "expected": "Rispondere solo se nel CCNL caricato parla di assistenza sindacale. Se non emerge, dirlo.",
+          "must_include": ["assistenza sindacale (se presente) o 'non emerge'"],
+          "must_not_include": ["sempre previsto (senza fonte CCNL)"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "DI-04",
+          "question": "Assemblea sindacale: quando e come si può indire?",
+          "expected": "Se nel CCNL caricato parla di assemblee (RSU, organizzazioni, modalità), riportare. Se non emerge, dirlo. Non confondere con visite mediche.",
+          "must_include": ["assemblea"],
+          "must_not_include": ["visite mediche"],
+          "notes": "Corregge l'errore pag.32."
+        },
+        {
+          "id": "DI-05",
+          "question": "Permessi per dirigenti sindacali: sono previsti?",
+          "expected": "Rispondere solo se nel CCNL caricato emergono permessi sindacali specifici e condizioni. Se non emerge, dirlo.",
+          "must_include": ["permessi sindacali (se presenti) o 'non emerge'"],
+          "must_not_include": ["15 giorni (se non trovato)"],
+          "notes": "Anti-invenzione."
+        },
+        {
+          "id": "DI-06",
+          "question": "La stampa sindacale può essere distribuita in azienda?",
+          "expected": "Se nel CCNL caricato emerge regola su stampa sindacale e orari, riportare. Se non emerge, dirlo.",
+          "must_include": ["stampa sindacale (se presente) o 'non emerge'"],
+          "must_not_include": ["sempre durante orario (senza fonte)"],
+          "notes": "Tema nel tuo estratto pag.32."
+        },
+        {
+          "id": "DI-07",
+          "question": "Trasferimento: quali tutele o condizioni?",
+          "expected": "Rispondere solo se CCNL caricato parla di trasferimenti (ragioni tecniche/organizzative, preavviso). Se non emerge, dirlo.",
+          "must_include": ["trasferimento (se presente) o 'non emerge'"],
+          "must_not_include": ["non si può mai (senza fonte)"],
+          "notes": "No assoluti."
+        },
+        {
+          "id": "DI-08",
+          "question": "Posso essere trasferito senza motivo?",
+          "expected": "Rispondere solo se CCNL caricato parla di motivazioni necessarie. Se non emerge, dirlo.",
+          "must_include": ["motivazioni (se presenti) o 'non emerge'"],
+          "must_not_include": ["mai possibile (senza fonte)"],
+          "notes": "Prudenza."
+        },
+        {
+          "id": "DI-09",
+          "question": "Chi risolve le controversie interpretative sul CCNL?",
+          "expected": "Rispondere solo se nel CCNL caricato ci sono organismi/commissioni. Se non emerge, dirlo e suggerire RSU/UILCOM.",
+          "must_include": ["RSU/UILCOM"],
+          "must_not_include": ["tribunale come unica via (senza fonte)"],
+          "notes": "Consiglio pratico."
+        },
+        {
+          "id": "DI-10",
+          "question": "Dove posso trovare le procedure interne IPZS oltre al CCNL?",
+          "expected": "Risposta pratica: accordi aziendali, ordini di servizio, regolamenti interni; suggerire RSU/HR. Non inventare procedure.",
+          "must_include": ["accordi aziendali", "ordine di servizio", "HR"],
+          "must_not_include": ["procedure IPZS specifiche inventate"],
+          "notes": "IPZS dipende molto da aziendale."
+        }
+      ]
+    }
+  ]
+}
