@@ -1,17 +1,16 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva)
-# ✅ Risposte SOLO dal CCNL
-# ✅ Utenti: risposta pulita (senza fonti)
-# ✅ Admin: debug + evidenze + chunk/pagine usate
+# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva + Upgrade 3)
+# ✅ Risposte SOLO dal CCNL (PUBLIC pulito)
+# ✅ Admin: debug + evidenze + chunk/pagine usate (solo admin)
+# ✅ Upgrade A: Dataset UILCOM (Q/A reali) come “guardrail di precisione”
+# ✅ Upgrade B: Auto-correzione Admin → aggiunge domande/risposte al dataset_uilcom.json
 # ✅ Fix: ex festività = festività soppresse/abolite/infrasettimanali abolite
 # ✅ Fix: mansioni superiori (30/60 + posto vacante + esclusione conservazione posto)
 # ✅ Fix: lavoro notturno vs straordinario notturno (non confondere %)
-# ✅ Upgrade: differenza paga / differenze retributive / arretrati (guardrail anti-invenzione)
 # ✅ Indice vettoriale persistente (vectors.npy + chunks.json)
 
 import os
 import json
 import re
-import time
 import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -59,18 +58,23 @@ MAX_EVIDENCE_LINES = 18
 LLM_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0
 
+# Dataset UILCOM (Q/A)
+DATASET_PATH = "dataset_uilcom.json"
+DATASET_INDEX_DIR = "index_dataset"
+DATASET_VEC_PATH = os.path.join(DATASET_INDEX_DIR, "dataset_vectors.npy")
+DATASET_META_PATH = os.path.join(DATASET_INDEX_DIR, "dataset_meta.json")
+DATASET_TOP_K = 4  # quante Q/A mostrare al modello come guardrail
+
 
 # ============================================================
 # SECRETS / PASSWORDS
 # ============================================================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    # Streamlit Cloud: st.secrets
     try:
         if key in st.secrets:  # type: ignore
             return str(st.secrets[key])  # type: ignore
     except Exception:
         pass
-    # Env
     return os.getenv(key, default)
 
 
@@ -114,8 +118,6 @@ if UILCOM_PASSWORD:
                 st.error("Password non corretta.")
 else:
     st.warning("Password iscritti non impostata. Imposta UILCOM_PASSWORD in Secrets (Streamlit) o variabile d’ambiente.")
-    # Per sviluppo locale puoi forzare qui:
-    # st.session_state.auth_ok = True
 
 if not st.session_state.auth_ok:
     st.stop()
@@ -157,11 +159,8 @@ with st.sidebar:
     st.write("Indice presente:", "✅" if ok_index else "❌")
 
     if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
-        # Rebuild
         try:
-            with st.spinner("Indicizzazione in corso..."):
-                n = None
-
+            with st.spinner("Indicizzazione CCNL in corso..."):
                 if not os.path.exists(PDF_PATH):
                     raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
 
@@ -170,43 +169,35 @@ with st.sidebar:
                 loader = PyPDFLoader(PDF_PATH)
                 docs = loader.load()
 
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-                )
+                splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
                 chunks = splitter.split_documents(docs)
 
                 texts = [c.page_content for c in chunks]
-                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based
+                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # 1-based
 
-                # Embeddings
                 if not OPENAI_API_KEY:
                     raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
 
                 emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors = emb.embed_documents(texts)
-                vectors = np.array(vectors, dtype=np.float32)
+                vectors = np.array(emb.embed_documents(texts), dtype=np.float32)
 
                 np.save(VEC_PATH, vectors)
                 with open(META_PATH, "w", encoding="utf-8") as f:
-                    json.dump(
-                        [{"page": p, "text": t} for p, t in zip(pages, texts)],
-                        f,
-                        ensure_ascii=False,
-                    )
+                    json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
 
-                n = len(chunks)
-
-            st.success(f"Indicizzazione completata. Chunk: {n}")
+            st.success(f"Indicizzazione CCNL completata. Chunk: {len(texts)}")
             st.rerun()
         except Exception as e:
             st.error(str(e))
 
     if st.button("🧹 Nuova chat", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.last_user_question = ""
+        st.session_state.last_public_answer = ""
         st.rerun()
 
     st.divider()
-    st.caption("Suggerimento: dopo modifiche a app.py su GitHub, Streamlit Cloud in genere fa auto-redeploy. Se no: **Reboot app**.")
+    st.caption("Dopo modifiche a app.py su GitHub, Streamlit Cloud di solito fa auto-redeploy. Se no: **Reboot app**.")
 
 
 # ============================================================
@@ -222,23 +213,35 @@ if not OPENAI_API_KEY:
 
 
 # ============================================================
-# RETRIEVAL HELPERS
+# IO HELPERS (dataset)
 # ============================================================
+def safe_read_json(path: str, default):
+    try:
+        if not os.path.exists(path):
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def safe_write_json(path: str, data) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
-
 
 def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     return mat_norm @ q
 
 
-def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+# ============================================================
+# LOAD INDEX CCNL
+# ============================================================
+def load_index_ccnl() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
     vectors = np.load(VEC_PATH)
-    with open(META_PATH, "r", encoding="utf-8") as f:
-        meta = json.load(f)
-
-    # Safety: ensure dict list
+    meta = safe_read_json(META_PATH, [])
     fixed = []
     for item in meta:
         if isinstance(item, dict) and "text" in item and "page" in item:
@@ -248,6 +251,92 @@ def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         else:
             fixed.append({"page": "?", "text": str(item)})
     return vectors, fixed
+
+
+# ============================================================
+# DATASET UILCOM: BUILD / LOAD INDEX
+# ============================================================
+def dataset_exists() -> bool:
+    return os.path.exists(DATASET_PATH)
+
+def load_dataset_entries() -> List[Dict[str, Any]]:
+    data = safe_read_json(DATASET_PATH, [])
+    out = []
+    if isinstance(data, list):
+        for x in data:
+            if isinstance(x, dict):
+                domanda = str(x.get("domanda", "")).strip()
+                risposta = str(x.get("risposta_corretta", "")).strip()
+                categoria = str(x.get("categoria", "")).strip()
+                if domanda and risposta:
+                    out.append({"domanda": domanda, "risposta_corretta": risposta, "categoria": categoria})
+    return out
+
+def build_dataset_index(entries: List[Dict[str, Any]], emb: OpenAIEmbeddings) -> None:
+    os.makedirs(DATASET_INDEX_DIR, exist_ok=True)
+    # Embedding on "domanda" (search by user question)
+    qs = [e["domanda"] for e in entries]
+    if not qs:
+        # remove any old index
+        try:
+            if os.path.exists(DATASET_VEC_PATH):
+                os.remove(DATASET_VEC_PATH)
+            if os.path.exists(DATASET_META_PATH):
+                os.remove(DATASET_META_PATH)
+        except Exception:
+            pass
+        return
+    vecs = np.array(emb.embed_documents(qs), dtype=np.float32)
+    np.save(DATASET_VEC_PATH, vecs)
+    safe_write_json(DATASET_META_PATH, entries)
+
+def load_dataset_index() -> Tuple[Optional[np.ndarray], List[Dict[str, Any]]]:
+    if not (os.path.exists(DATASET_VEC_PATH) and os.path.exists(DATASET_META_PATH)):
+        return None, []
+    vecs = np.load(DATASET_VEC_PATH)
+    meta = safe_read_json(DATASET_META_PATH, [])
+    if not isinstance(meta, list):
+        meta = []
+    fixed = []
+    for e in meta:
+        if isinstance(e, dict):
+            fixed.append({
+                "domanda": str(e.get("domanda", "")).strip(),
+                "risposta_corretta": str(e.get("risposta_corretta", "")).strip(),
+                "categoria": str(e.get("categoria", "")).strip(),
+            })
+    return vecs, fixed
+
+def get_dataset_hits(query: str, emb: OpenAIEmbeddings) -> List[Dict[str, Any]]:
+    vecs, meta = load_dataset_index()
+    if vecs is None or not meta:
+        return []
+    mat_norm = normalize_rows(vecs)
+    qvec = np.array(emb.embed_query(query), dtype=np.float32)
+    sims = cosine_scores(qvec, mat_norm)
+    top_idx = np.argsort(-sims)[:DATASET_TOP_K]
+    out = []
+    for i in top_idx:
+        i = int(i)
+        if i < 0 or i >= len(meta):
+            continue
+        item = meta[i]
+        score = float(sims[i])
+        out.append({**item, "score": score})
+    return out
+
+
+# ============================================================
+# OPTIONAL BM25 RERANK (precision boost)
+# ============================================================
+def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not BM25_AVAILABLE or not candidates:
+        return candidates
+    corpus = [(c.get("text") or "").lower().split() for c in candidates]
+    bm25 = BM25Okapi(corpus)
+    scores = bm25.get_scores(query.lower().split())
+    idx = np.argsort(-np.array(scores))
+    return [candidates[int(i)] for i in idx]
 
 
 # ============================================================
@@ -295,21 +384,6 @@ STRAORDINARI_TRIGGERS = [
     "notturno", "festivo", "supplementare"
 ]
 
-# ✅ UPGRADE: differenza paga / arretrati / differenze retributive
-DIFF_PAGA_TRIGGERS = [
-    "differenza paga", "differenze paga",
-    "differenza retrib", "differenze retrib",
-    "arretrati", "arretrato",
-    "conguaglio", "conguagli",
-    "adeguamento retributivo", "adeguamento stipendiale",
-    "mi devono pagare di più", "mi devono pagare di piu",
-    "mi spetta di più", "mi spetta di piu",
-    "quanto mi spetta in più", "quanto mi spetta in piu",
-    "differenze in busta paga", "busta paga differenze",
-    "riconoscimento economico", "riconoscimento retributivo",
-]
-
-
 def is_mansioni_question(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in MANSIONI_TRIGGERS)
@@ -336,12 +410,7 @@ def is_straordinario_notturno_question(q: str) -> bool:
 
 def is_lavoro_notturno_question(q: str) -> bool:
     ql = q.lower()
-    # lavoro notturno "ordinario": notturno ma NON straordinario
     return ("notturn" in ql) and ("straordin" not in ql)
-
-def is_diff_paga_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in DIFF_PAGA_TRIGGERS)
 
 
 # ============================================================
@@ -382,7 +451,6 @@ def build_permessi_expansion_queries(user_q: str) -> List[str]:
         f"{base} permessi donazione sangue",
         f"{base} assenze retribuite elenco tipologie",
     ]
-    # unique + limit
     out, seen = [], set()
     for x in qs:
         x = x.strip()
@@ -428,10 +496,7 @@ def build_queries(q: str) -> List[str]:
     user_is_mal = is_malattia_question(q0)
     user_is_mans = is_mansioni_question(q0)
     user_is_conserv = is_conservazione_context(q0)
-    user_is_diff = is_diff_paga_question(q0)
 
-    # ========== ROL / ex festività (terminologia corretta) ==========
-    # Nota: nel CCNL potrebbe NON esistere la parola "ex festività"
     if user_is_rol:
         qs += [
             "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
@@ -442,7 +507,6 @@ def build_queries(q: str) -> List[str]:
             "residui ROL scadenze eventuale monetizzazione (se prevista)",
         ]
 
-    # ========== Permessi generici (inclusi ROL/ex-fest se chiesto) ==========
     if user_is_perm and (not user_is_rol):
         qs += [
             "permessi retribuiti tipologie CCNL elenco completo",
@@ -450,14 +514,10 @@ def build_queries(q: str) -> List[str]:
             "permessi sindacali assemblea ore retribuite",
             "diritto allo studio 150 ore triennio permessi retribuiti",
             "permessi per esami lavoratori studenti una settimana di calendario all'anno",
-        ]
-        # Aggancio sinonimi “ex festività” anche qui, perché spesso lo chiedono dentro "permessi"
-        qs += [
             "ROL riduzione orario di lavoro riposi retribuiti",
             "festività soppresse abolite riposi retribuiti",
         ]
 
-    # ========== Malattia ==========
     if user_is_mal:
         qs += [
             "malattia trattamento economico percentuali integrazione",
@@ -468,7 +528,6 @@ def build_queries(q: str) -> List[str]:
             "ricovero ospedaliero day hospital ricaduta",
         ]
 
-    # ========== Straordinari / notturno ==========
     if any(t in qlow for t in STRAORDINARI_TRIGGERS):
         qs += [
             "lavoro straordinario maggiorazioni limiti",
@@ -478,7 +537,6 @@ def build_queries(q: str) -> List[str]:
             "lavoro festivo maggiorazioni",
         ]
 
-    # ========== Mansioni superiori / categoria ==========
     if user_is_mans or user_is_conserv:
         qs += [
             "mansioni superiori regole generali posto vacante",
@@ -489,23 +547,6 @@ def build_queries(q: str) -> List[str]:
             "formazione addestramento affiancamento non costituisce mansioni superiori",
         ]
 
-    # ✅ UPGRADE: Differenza paga / arretrati / differenze retributive
-    if user_is_diff:
-        qs += [
-            "differenze retributive trattamento economico corrispondente all'attività svolta",
-            "trattamento economico corrispondente all'attività svolta mansioni superiori",
-            "differenze retributive mansioni superiori arretrati conguaglio",
-            "arretrati conguaglio differenze busta paga mansioni superiori",
-            "riconoscimento economico trattamento retributivo per mansioni superiori",
-            "retribuzione dovuta in caso di mansioni superiori",
-        ]
-        # spesso è collegata a mansioni superiori, quindi aggancio anche 30/60 + posto vacante
-        qs += [
-            "mansioni superiori 30 giorni consecutivi 60 giorni discontinui trattamento economico",
-            "posto vacante mansioni superiori trattamento economico",
-        ]
-
-    # Unique + limit
     out, seen = [], set()
     for x in qs:
         x = x.strip()
@@ -521,10 +562,6 @@ def build_queries(q: str) -> List[str]:
 def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
     patterns = [
         r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"%",
-
-        r"retribuzion", r"trattamento\s+econom", r"trattamento\s+retribut",
-        r"differenz", r"arretrat", r"conguagli",
-
         r"posto\s+vacante", r"mansioni?\s+superiori?", r"sostituzion",
         r"conservazion.*posto", r"diritto.*conservazion.*posto",
         r"non\s+si\s+applica", r"non\s+costituisc",
@@ -542,7 +579,6 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
     for c in chunks:
         page = c.get("page", "?")
         text = c.get("text", "") or ""
-        # Split lines
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         for ln in lines:
             ln_low = ln.lower()
@@ -551,7 +587,6 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
                 if 20 <= len(ln_clean) <= 420:
                     evidences.append(f"(pag. {page}) {ln_clean}")
 
-    # unique
     out, seen = [], set()
     for e in evidences:
         if e not in seen:
@@ -559,61 +594,39 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
             seen.add(e)
     return out[:MAX_EVIDENCE_LINES]
 
-
 def evidence_has_30_60(evidence_lines: List[str]) -> bool:
     joined = " ".join(evidence_lines).lower()
     return (re.search(r"\b30\b", joined) is not None) and (re.search(r"\b60\b", joined) is not None)
 
 
 # ============================================================
-# OPTIONAL BM25 RERANK (precision boost)
-# ============================================================
-def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not BM25_AVAILABLE or not candidates:
-        return candidates
-
-    # tokenize naive
-    corpus = [(c.get("text") or "").lower().split() for c in candidates]
-    bm25 = BM25Okapi(corpus)
-    scores = bm25.get_scores(query.lower().split())
-    idx = np.argsort(-np.array(scores))  # descending
-    return [candidates[int(i)] for i in idx]
-
-
-# ============================================================
-# SYSTEM RULES (core)
+# SYSTEM RULES (core) + DATASET GUARDRAIL
 # ============================================================
 RULES = """
 Sei l’assistente UILCOM per lavoratori IPZS.
 Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto (estratti CCNL) fornito.
 Non inventare informazioni.
 
+IMPORTANTE (dataset UILCOM):
+- Potresti ricevere anche un elenco di Q/A "Dataset UILCOM" (basato su casi reali).
+- Usa il dataset SOLO come "guardrail" per interpretare correttamente il CCNL, MA NON deve contraddire il contesto CCNL.
+- Se dataset e CCNL sono in conflitto o il CCNL non conferma, devi seguire il CCNL e dichiarare che nel CCNL recuperato non emerge.
+
 REGOLE IMPORTANTI:
 1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nel CCNL caricato."
-
-2) DIFFERENZA PAGA / ARRETRATI:
-   - Non inventare importi o percentuali.
-   - Puoi dire "spetta il trattamento economico corrispondente" SOLO se nel contesto c'è una frase che lo prevede.
-   - Se l’utente chiede "quanto mi spetta" e nel CCNL non ci sono cifre/criteri specifici nel contesto recuperato,
-     devi dire chiaramente che l’importo non è determinabile dal CCNL recuperato e che serve busta paga/accordi aziendali/HR.
-
-3) NON confondere lavoro notturno con straordinario notturno:
+2) NON confondere lavoro notturno con straordinario notturno:
    - Se la domanda è "lavoro notturno" (ordinario), usa solo regole/percentuali del notturno ordinario.
    - Se nel contesto trovi solo "straordinario notturno", devi dirlo e NON applicarlo al notturno ordinario.
-
-4) MANSIONI SUPERIORI / CATEGORIA:
+3) MANSIONI SUPERIORI / CATEGORIA:
    - Se nel contesto emergono 30 giorni consecutivi / 60 giorni non consecutivi, questi vanno riportati.
    - Se nel contesto emerge la distinzione posto vacante vs sostituzione con conservazione del posto, riportala chiaramente.
-
-5) TERMINOLOGIA EX FESTIVITÀ:
+4) TERMINOLOGIA EX FESTIVITÀ:
    - Se l’utente dice "ex festività" ma nel CCNL trovi "festività soppresse/abolite/infrasettimanali abolite",
      spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
-
-6) Permessi:
+5) Permessi:
    - Elenca SOLO le tipologie che trovi nel contesto.
    - Se l’utente chiede "tutti i permessi", includi anche ROL/festività abolite solo se compaiono nel contesto recuperato.
-
-7) Output: prepara una risposta pulita per l’utente (senza citare pagine).
+6) Output: prepara una risposta pulita per l’utente (senza citare pagine).
    Le pagine/estratti vanno messi SOLO nella sezione ADMIN.
 
 FORMATO OUTPUT OBBLIGATORIO:
@@ -624,9 +637,76 @@ FORMATO OUTPUT OBBLIGATORIO:
 
 <ADMIN>
 - Evidenze: ...
+- Dataset hits: ...
 - Pagine/chunk usati: ...
 </ADMIN>
 """
+
+
+# ============================================================
+# ADMIN: DATASET UI (auto-correzione)
+# ============================================================
+def admin_dataset_panel(emb: OpenAIEmbeddings) -> None:
+    if not st.session_state.is_admin:
+        return
+
+    with st.sidebar:
+        st.divider()
+        st.subheader("📘 Dataset UILCOM (Auto-correzione)")
+
+        exists = dataset_exists()
+        st.write("dataset_uilcom.json:", "✅" if exists else "❌ (crealo nella repo/progetto)")
+
+        entries = load_dataset_entries()
+        st.caption(f"Voci dataset attuali: {len(entries)}")
+
+        # Build/Rebuild dataset index
+        if st.button("Indicizza dataset UILCOM", use_container_width=True):
+            try:
+                with st.spinner("Indicizzazione dataset in corso..."):
+                    entries = load_dataset_entries()
+                    build_dataset_index(entries, emb)
+                st.success("Dataset indicizzato.")
+            except Exception as e:
+                st.error(f"Errore indicizzazione dataset: {e}")
+
+        # Quick add from last Q/A
+        st.caption("Suggerimento: dopo una risposta sbagliata, incolla qui la correzione e salva.")
+
+        default_q = st.session_state.get("last_user_question", "")
+        default_a = st.session_state.get("last_public_answer", "")
+
+        with st.form("add_dataset_form", clear_on_submit=False):
+            domanda = st.text_area("Domanda (utente)", value=default_q, height=80)
+            risposta = st.text_area("Risposta corretta (UILCOM)", value="", height=110)
+            categoria = st.text_input("Categoria (es. permessi, mansioni_superiori, malattia, straordinari...)", value="")
+            salva = st.form_submit_button("➕ Aggiungi al dataset", use_container_width=True)
+
+        if salva:
+            try:
+                domanda = (domanda or "").strip()
+                risposta = (risposta or "").strip()
+                categoria = (categoria or "").strip()
+                if not domanda or not risposta:
+                    st.error("Compila almeno Domanda e Risposta corretta.")
+                else:
+                    data = safe_read_json(DATASET_PATH, [])
+                    if not isinstance(data, list):
+                        data = []
+                    data.append({
+                        "domanda": domanda,
+                        "risposta_corretta": risposta,
+                        "categoria": categoria
+                    })
+                    safe_write_json(DATASET_PATH, data)
+
+                    # rebuild dataset index immediately (best UX)
+                    with st.spinner("Aggiorno indice dataset..."):
+                        build_dataset_index(load_dataset_entries(), emb)
+
+                    st.success("Aggiunto al dataset + indicizzato.")
+            except Exception as e:
+                st.error(f"Errore salvataggio dataset: {e}")
 
 
 # ============================================================
@@ -634,22 +714,43 @@ FORMATO OUTPUT OBBLIGATORIO:
 # ============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "last_user_question" not in st.session_state:
+    st.session_state.last_user_question = ""
+if "last_public_answer" not in st.session_state:
+    st.session_state.last_public_answer = ""
+
+# Prepare embeddings instance (used for CCNL + dataset)
+emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+
+# Admin dataset panel
+admin_dataset_panel(emb)
 
 # Render chat (pulita)
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
-        # Admin-only debug for assistant messages
         if st.session_state.is_admin and m["role"] == "assistant":
             dbg = m.get("debug", None)
             if dbg:
-                with st.expander("🧠 Admin: Query / Evidenze / Chunk (debug)", expanded=False):
+                with st.expander("🧠 Admin: Query / Evidenze / Dataset / Chunk (debug)", expanded=False):
                     st.write("**Domanda arricchita (memoria breve):**")
                     st.code(dbg.get("enriched_q", ""))
+
                     st.write("**Query usate:**")
                     st.code("\n".join(dbg.get("queries", [])))
-                    st.write("**Evidenze estratte:**")
+
+                    st.write("**Dataset hits (guardrail):**")
+                    ds = dbg.get("dataset_hits", [])
+                    if ds:
+                        for h in ds:
+                            st.write(f"- score={h.get('score'):.3f} | cat={h.get('categoria','')} | domanda: {h.get('domanda','')}")
+                            st.write(f"  risposta: {h.get('risposta_corretta','')}")
+                    else:
+                        st.write("(nessuno)")
+
+                    st.write("**Evidenze estratte (CCNL):**")
                     st.code("\n".join(dbg.get("evidence", [])) or "(nessuna)")
+
                     st.write("**Chunk selezionati (prime righe):**")
                     for c in dbg.get("selected", []):
                         st.write(f"**Pagina {c.get('page')}**")
@@ -663,7 +764,7 @@ user_input = st.chat_input("Scrivi una domanda sul CCNL (permessi, ROL/festivit�
 if not user_input:
     st.stop()
 
-# Require index
+# Require index CCNL
 if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.session_state.messages.append({
@@ -674,30 +775,30 @@ if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
 
 # Append user msg
 st.session_state.messages.append({"role": "user", "content": user_input})
+st.session_state.last_user_question = user_input
 
 
 # ============================================================
-# RETRIEVAL PIPELINE
+# RETRIEVAL PIPELINE (CCNL + Dataset guardrail)
 # ============================================================
 enriched_q = build_enriched_question(user_input)
 
-vectors, meta = load_index()
+vectors, meta = load_index_ccnl()
 mat_norm = normalize_rows(vectors)
-emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
 queries = build_queries(enriched_q)
 
-# Multi-query semantic retrieval
+# Multi-query semantic retrieval (CCNL)
 scores_best: Dict[int, float] = {}
-
 for q in queries:
     qvec = np.array(emb.embed_query(q), dtype=np.float32)
     sims = cosine_scores(qvec, mat_norm)
     top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
     for i in top_idx:
-        s = float(sims[int(i)])
-        if (int(i) not in scores_best) or (s > scores_best[int(i)]):
-            scores_best[int(i)] = s
+        i = int(i)
+        s = float(sims[i])
+        if (i not in scores_best) or (s > scores_best[i]):
+            scores_best[i] = s
 
 provisional_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
 provisional_selected = [meta[i] for i in provisional_idx]
@@ -716,27 +817,23 @@ if user_is_perm and (not user_is_rol):
             sims = cosine_scores(qvec, mat_norm)
             top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
             for i in top_idx:
-                s = float(sims[int(i)])
-                if (int(i) not in scores_best) or (s > scores_best[int(i)]):
-                    scores_best[int(i)] = s
+                i = int(i)
+                s = float(sims[i])
+                if (i not in scores_best) or (s > scores_best[i]):
+                    scores_best[i] = s
 
-# Re-ranking with domain boosts (fix mansioni + notturno + diff paga)
+# Re-ranking with domain boosts (mansioni + notturno)
 user_is_mans = is_mansioni_question(enriched_q) or ("categoria" in enriched_q.lower())
 user_is_conserv = is_conservazione_context(enriched_q)
 user_is_notturno = is_lavoro_notturno_question(enriched_q)
 user_is_straord_notturno = is_straordinario_notturno_question(enriched_q)
 
-# ✅ differenza paga
-user_is_diff = is_diff_paga_question(enriched_q)
-
-# If mansioni and we saw 30/60 in evidence, prioritize those chunks
 force_30_60 = evidence_has_30_60(provisional_evidence) and user_is_mans
 
 for i in list(scores_best.keys()):
     txt = (meta[i].get("text") or "").lower()
     boost = 0.0
 
-    # Mansioni superiori boosts
     if user_is_mans or user_is_conserv:
         if re.search(r"\b30\b", txt) and re.search(r"\b60\b", txt):
             boost += 0.18
@@ -749,80 +846,63 @@ for i in list(scores_best.keys()):
         if "affianc" in txt or "formaz" in txt or "addestr" in txt:
             boost += 0.03
 
-    # ROL / festività soppresse boosts
     if user_is_rol:
         if re.search(r"\brol\b", txt) or "riduzione orario" in txt:
             boost += 0.16
         if "festività soppresse" in txt or "festivita soppresse" in txt or "abolite" in txt or "infrasettimanali" in txt:
             boost += 0.16
-        # Evita confondere con studio
         if "diritto allo studio" in txt or "150 ore" in txt:
             boost -= 0.10
 
-    # Notturno vs straordinario notturno
     if user_is_notturno:
-        # favorisci “lavoro notturno” e penalizza “straordinario” se la domanda è ordinaria
         if "notturn" in txt and "straordin" not in txt:
             boost += 0.10
         if "straordin" in txt and "notturn" in txt:
             boost -= 0.08
+
     if user_is_straord_notturno:
         if "straordin" in txt and "notturn" in txt:
             boost += 0.12
 
-    # Permessi generic boosts
     if user_is_perm and (not user_is_rol):
         if "permess" in txt or "assenze retribuite" in txt:
             boost += 0.07
-
-    # ✅ Differenza paga / arretrati boosts
-    if user_is_diff:
-        # blocchi che parlano di trattamento economico/retribuzione/differenze
-        if ("retribuzion" in txt) or ("trattamento econom" in txt) or ("trattamento retribut" in txt):
-            boost += 0.12
-        if ("differenz" in txt) or ("arretrat" in txt) or ("conguagli" in txt) or ("conguaglio" in txt):
-            boost += 0.12
-        # spesso è legato a mansioni superiori
-        if ("mansioni superior" in txt) or ("mansione superior" in txt):
-            boost += 0.06
 
     scores_best[i] = scores_best[i] + boost
 
 final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
 selected = [meta[i] for i in final_idx]
 
-# Optional BM25 rerank for final precision
+# Optional BM25 rerank for CCNL precision
 selected = bm25_rerank(enriched_q, selected)
 
-# Build context for LLM
-context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
+# Dataset hits (guardrail)
+dataset_hits = get_dataset_hits(enriched_q, emb)
+
+# Build contexts
+ccnl_context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
+
+dataset_context = ""
+if dataset_hits:
+    lines = []
+    for h in dataset_hits:
+        cat = h.get("categoria", "")
+        lines.append(f"- [cat={cat}] DOMANDA: {h.get('domanda','')}\n  RISPOSTA UILCOM: {h.get('risposta_corretta','')}")
+    dataset_context = "\n".join(lines)
 
 key_evidence = extract_key_evidence(selected)
 evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
 
 guardrail_mansioni = ""
 if force_30_60:
-    guardrail_mansioni = (
-        "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori se parli di passaggio categoria/mansioni superiori.\n"
-    )
+    guardrail_mansioni = "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori se parli di passaggio categoria/mansioni superiori.\n"
 
 guardrail_notturno = ""
 if user_is_notturno:
-    guardrail_notturno = (
-        "GUARDRAIL NOTTURNO: la domanda è su lavoro notturno (ordinario). NON usare percentuali di straordinario notturno.\n"
-    )
+    guardrail_notturno = "GUARDRAIL NOTTURNO: la domanda è su lavoro notturno (ordinario). NON usare percentuali di straordinario notturno.\n"
 elif user_is_straord_notturno:
-    guardrail_notturno = (
-        "GUARDRAIL STRAORD. NOTTURNO: la domanda è su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
-    )
+    guardrail_notturno = "GUARDRAIL STRAORD. NOTTURNO: la domanda è su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
 
-guardrail_diff_paga = ""
-if user_is_diff:
-    guardrail_diff_paga = (
-        "GUARDRAIL DIFFERENZA PAGA: l’utente chiede differenza paga/arretrati. "
-        "NON inventare importi/percentuali. Se il contesto non consente di quantificare, "
-        "spiega che l’importo non è determinabile dal CCNL recuperato.\n"
-    )
 
 # ============================================================
 # LLM CALL
@@ -834,7 +914,6 @@ prompt = f"""
 
 {guardrail_mansioni}
 {guardrail_notturno}
-{guardrail_diff_paga}
 
 DOMANDA (UTENTE):
 {user_input}
@@ -842,15 +921,18 @@ DOMANDA (UTENTE):
 DOMANDA ARRICCHITA (MEMORIA BREVE):
 {enriched_q}
 
-EVIDENZE (se presenti, sono operative):
+DATASET UILCOM (guardrail, se presente — NON deve contraddire il CCNL):
+{dataset_context if dataset_context else "(nessun match dataset)"}
+
+EVIDENZE CCNL (se presenti, sono operative):
 {evidence_block}
 
 CONTESTO CCNL (estratti):
-{context}
+{ccnl_context}
 
 RICORDA:
-- Nel PUBLIC: risposta pulita, senza pagine.
-- Nel ADMIN: inserisci elenco pagine trovate e 5-10 righe evidenza più importanti con (pag. X).
+- Nel PUBLIC: risposta pulita, senza pagine e senza citazioni.
+- Nel ADMIN: inserisci elenco pagine trovate + evidenze con (pag. X) + elenco dataset hits usati (se presenti).
 """
 
 def split_public_admin(text: str) -> Tuple[str, str]:
@@ -862,7 +944,6 @@ def split_public_admin(text: str) -> Tuple[str, str]:
         pub = m_pub.group(1).strip()
     else:
         pub = text.strip()
-
     if m_adm:
         adm = m_adm.group(1).strip()
     return pub, adm
@@ -874,9 +955,11 @@ except Exception as e:
 
 public_ans, admin_ans = split_public_admin(raw)
 
-# Fallback: if model forgot format, enforce minimal
 if not public_ans:
     public_ans = "Non ho trovato la risposta nel CCNL caricato."
+
+st.session_state.last_public_answer = public_ans
+
 
 # ============================================================
 # OUTPUT (utente pulito + admin debug)
@@ -886,16 +969,16 @@ assistant_payload: Dict[str, Any] = {
     "content": public_ans,
 }
 
-# Admin debug bundle (not visible to users)
 if st.session_state.is_admin:
     assistant_payload["debug"] = {
         "enriched_q": enriched_q,
         "queries": queries,
         "evidence": key_evidence,
         "selected": selected,
+        "dataset_hits": dataset_hits,
         "admin_llm_section": admin_ans,
         "bm25_available": BM25_AVAILABLE,
-        "diff_paga_mode": user_is_diff,
+        "dataset_exists": dataset_exists(),
     }
 
 st.session_state.messages.append(assistant_payload)
