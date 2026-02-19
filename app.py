@@ -1,6 +1,20 @@
+# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva)
+# ✅ Risposte SOLO dal CCNL
+# ✅ Utenti: risposta pulita (senza fonti)
+# ✅ Admin: debug + evidenze + chunk/pagine usate
+# ✅ Fix: ex festività = festività soppresse/abolite/infrasettimanali abolite
+# ✅ Fix: mansioni superiori (30/60 + posto vacante + esclusione conservazione posto)
+# ✅ Fix: lavoro notturno vs straordinario notturno (non confondere %)
+# ✅ Upgrade: differenza paga / differenze retributive / arretrati (guardrail anti-invenzione)
+# ✅ Indice vettoriale persistente (vectors.npy + chunks.json)
+
 import os
 import json
 import re
+import time
+import hashlib
+from typing import List, Dict, Any, Tuple, Optional
+
 import numpy as np
 import streamlit as st
 
@@ -8,182 +22,335 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-# =========================
-# UI Header (UILCOM)
-# =========================
-st.set_page_config(page_title="Assistente Contrattuale UILCOM IPZS", page_icon="🟦")
+# Optional (precision boost): rank-bm25
+try:
+    from rank_bm25 import BM25Okapi  # type: ignore
+    BM25_AVAILABLE = True
+except Exception:
+    BM25_AVAILABLE = False
 
-st.title("🟦 Assistente Contrattuale UILCOM IPZS")
-st.markdown(
-    "**Accesso riservato agli iscritti UILCOM**  \n"
-    "Questo servizio digitale è uno strumento informativo messo a disposizione dalla UILCOM per facilitare la consultazione "
-    "del CCNL Grafici Editoria e delle principali norme contrattuali applicabili ai lavoratori.  \n\n"
-    "Le risposte fornite dall’assistente sono basate sul contenuto del contratto collettivo caricato nel sistema e hanno finalità esclusivamente informative.  \n"
-    "Per situazioni specifiche, interpretazioni contrattuali o verifiche individuali si raccomanda di rivolgersi alle RSU UILCOM o alla struttura sindacale competente."
-)
-st.divider()
 
-# =========================
-# Config / Paths
-# =========================
+# ============================================================
+# CONFIG
+# ============================================================
+APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
 PDF_PATH = os.path.join("documenti", "ccnl.pdf")
+
 INDEX_DIR = "index_ccnl"
 VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
 META_PATH = os.path.join(INDEX_DIR, "chunks.json")
 
-TOP_K_FINAL = 18
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+
 TOP_K_PER_QUERY = 12
+TOP_K_FINAL = 18
 MAX_MULTI_QUERIES = 12
 
-# Memoria breve
 MEMORY_USER_TURNS = 3
 
-# Super-modulo permessi: soglia copertura (quante categorie diverse vogliamo trovare nei chunk)
+# Permessi: quante categorie diverse provare a coprire
 PERMESSI_MIN_CATEGORY_COVERAGE = 3
 
-# =========================
-# Password Gate (Solo iscritti)
-# =========================
-def get_secret_or_env(name: str):
-    val = None
+# Admin debug: quante righe evidenza mostrare
+MAX_EVIDENCE_LINES = 18
+
+# LLM
+LLM_MODEL = "gpt-4o-mini"
+LLM_TEMPERATURE = 0
+
+
+# ============================================================
+# SECRETS / PASSWORDS
+# ============================================================
+def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    # Streamlit Cloud: st.secrets
     try:
-        val = st.secrets.get(name, None)  # type: ignore
+        if key in st.secrets:  # type: ignore
+            return str(st.secrets[key])  # type: ignore
     except Exception:
-        val = None
-    if not val:
-        val = os.getenv(name)
-    return val
+        pass
+    # Env
+    return os.getenv(key, default)
 
-required_pwd = get_secret_or_env("UILCOM_PASSWORD")
-admin_pwd = get_secret_or_env("ADMIN_PASSWORD")
 
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin debug
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
+
+
+# ============================================================
+# PAGE SETUP
+# ============================================================
+st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
+st.title(APP_TITLE)
+st.markdown(
+    "**Accesso riservato agli iscritti UILCOM**  \n"
+    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** e norme applicabili ai lavoratori IPZS.  \n\n"
+    "⚠️ Le risposte sono generate **solo** in base al CCNL caricato. Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
+)
+st.divider()
+
+
+# ============================================================
+# AUTH: ISCRITTI
+# ============================================================
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
 
-if "admin_ok" not in st.session_state:
-    st.session_state.admin_ok = False
-
-# UILCOM login
-if required_pwd:
+if UILCOM_PASSWORD:
     with st.expander("🔒 Accesso iscritti UILCOM", expanded=not st.session_state.auth_ok):
-        pwd_in = st.text_input("Password iscritti", type="password", placeholder="Inserisci la password iscritti")
-        if st.button("Entra"):
-            if pwd_in == required_pwd:
+        pwd_in = st.text_input("Password iscritti", type="password", placeholder="Inserisci password iscritti")
+        if st.button("Entra", use_container_width=True):
+            if pwd_in == UILCOM_PASSWORD:
                 st.session_state.auth_ok = True
                 st.success("Accesso consentito.")
             else:
                 st.session_state.auth_ok = False
                 st.error("Password non corretta.")
 else:
-    # locale/test
-    st.info("🔐 Password iscritti non impostata (in locale puoi usare UILCOM_PASSWORD; online useremo Secrets).")
-    st.session_state.auth_ok = True
+    st.warning("Password iscritti non impostata. Imposta UILCOM_PASSWORD in Secrets (Streamlit) o variabile d’ambiente.")
+    # Per sviluppo locale puoi forzare qui:
+    # st.session_state.auth_ok = True
 
 if not st.session_state.auth_ok:
     st.stop()
 
-# Admin login (solo per vedere debug/fonti)
-if admin_pwd:
-    with st.sidebar.expander("🛠️ Admin (debug)", expanded=False):
-        ap = st.text_input("Admin password", type="password", placeholder="Solo amministratore")
-        if st.button("Accedi come admin"):
-            if ap == admin_pwd:
-                st.session_state.admin_ok = True
-                st.success("Admin attivo.")
-            else:
-                st.session_state.admin_ok = False
-                st.error("Admin password errata.")
-else:
-    # se non impostata, niente admin
-    st.session_state.admin_ok = False
 
-# =========================
-# Retrieval helpers
-# =========================
+# ============================================================
+# ADMIN MODE (debug)
+# ============================================================
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+
+with st.sidebar:
+    st.header("⚙️ Controlli")
+
+    # Admin login
+    st.subheader("🧠 Admin (debug)")
+    if ADMIN_PASSWORD:
+        admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Login admin", use_container_width=True):
+                if admin_in == ADMIN_PASSWORD:
+                    st.session_state.is_admin = True
+                    st.success("Admin attivo.")
+                else:
+                    st.session_state.is_admin = False
+                    st.error("Password admin errata.")
+        with c2:
+            if st.button("Logout", use_container_width=True):
+                st.session_state.is_admin = False
+    else:
+        st.caption("ADMIN_PASSWORD non impostata (Secrets).")
+
+    st.divider()
+
+    # Index management
+    st.subheader("📦 Indice CCNL")
+    ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
+    st.write("Indice presente:", "✅" if ok_index else "❌")
+
+    if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
+        # Rebuild
+        try:
+            with st.spinner("Indicizzazione in corso..."):
+                n = None
+
+                if not os.path.exists(PDF_PATH):
+                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
+
+                os.makedirs(INDEX_DIR, exist_ok=True)
+
+                loader = PyPDFLoader(PDF_PATH)
+                docs = loader.load()
+
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+                )
+                chunks = splitter.split_documents(docs)
+
+                texts = [c.page_content for c in chunks]
+                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based
+
+                # Embeddings
+                if not OPENAI_API_KEY:
+                    raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
+
+                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                vectors = emb.embed_documents(texts)
+                vectors = np.array(vectors, dtype=np.float32)
+
+                np.save(VEC_PATH, vectors)
+                with open(META_PATH, "w", encoding="utf-8") as f:
+                    json.dump(
+                        [{"page": p, "text": t} for p, t in zip(pages, texts)],
+                        f,
+                        ensure_ascii=False,
+                    )
+
+                n = len(chunks)
+
+            st.success(f"Indicizzazione completata. Chunk: {n}")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    if st.button("🧹 Nuova chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+    st.divider()
+    st.caption("Suggerimento: dopo modifiche a app.py su GitHub, Streamlit Cloud in genere fa auto-redeploy. Se no: **Reboot app**.")
+
+
+# ============================================================
+# HARD FAIL IF NO OPENAI KEY
+# ============================================================
+if not OPENAI_API_KEY:
+    st.error(
+        "Manca la variabile **OPENAI_API_KEY**.\n\n"
+        "Streamlit Cloud: **Settings → Secrets → OPENAI_API_KEY**\n"
+        "Locale: variabile d’ambiente OPENAI_API_KEY"
+    )
+    st.stop()
+
+
+# ============================================================
+# RETRIEVAL HELPERS
+# ============================================================
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
+
 
 def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     return mat_norm @ q
 
-# =========================
-# Trigger dizionari
-# =========================
+
+def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    vectors = np.load(VEC_PATH)
+    with open(META_PATH, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    # Safety: ensure dict list
+    fixed = []
+    for item in meta:
+        if isinstance(item, dict) and "text" in item and "page" in item:
+            fixed.append({"page": item.get("page", "?"), "text": item.get("text", "")})
+        elif isinstance(item, str):
+            fixed.append({"page": "?", "text": item})
+        else:
+            fixed.append({"page": "?", "text": str(item)})
+    return vectors, fixed
+
+
+# ============================================================
+# TRIGGERS / CLASSIFIERS
+# ============================================================
+MANSIONI_TRIGGERS = [
+    "mansioni superiori", "mansione superiore", "mansioni più alte", "mansioni piu alte",
+    "categoria superiore", "livello superiore", "passaggio di categoria", "cambio categoria",
+    "inquadramento superiore", "posto vacante", "sostituzione", "sto sostituendo",
+]
+
 CONSERVAZIONE_TRIGGERS = [
     "maternità", "maternita", "congedo maternità", "congedo maternita",
     "congedo parentale", "parentale",
-    "malattia", "infortunio",
-    "aspettativa",
-    "assente", "assenza", "sostituzione", "sostituendo", "sto sostituendo",
-]
-
-MANSIONI_ALTE_TRIGGERS = [
-    "mansioni più alte", "mansioni piu alte",
-    "mansioni più elevate", "mansioni piu elevate",
-    "mansioni superiori", "mansioni superiore", "mansione superiore",
-    "lavoro più alto", "lavoro piu alto",
-    "sto facendo il lavoro", "mi fanno fare il lavoro", "mi stanno facendo fare",
-    "sto facendo mansioni", "faccio mansioni", "faccio il lavoro di",
-    "capoturno", "capo turno", "caporeparto", "capo reparto",
-    "sostituisco", "sto sostituendo",
-    "livello superiore", "categoria superiore", "inquadramento superiore",
-    "passaggio di livello", "passaggio categoria", "avanzamento", "promozione",
-    "posto vacante",
-]
-
-# ✅ UPGRADE DIFFERENZA PAGA
-DIFF_PAGA_TRIGGERS = [
-    "differenza paga", "differenze paga", "differenza pag", "differenza retribut",
-    "differenze retribut", "differenza stipend", "più soldi", "piu soldi",
-    "mi spetta di più", "mi spetta di piu", "mi devono pagare di più", "mi devono pagare di piu",
-    "mi devono pagare di più", "pagarmi di più", "pagarmi di piu",
-    "adeguamento retributivo", "trattamento economico", "trattamento retributivo",
-    "quanto mi spetta in più", "quanto mi spetta in piu", "arretrati", "arretrato",
-    "conguaglio", "differenze in busta paga", "busta paga differenze",
-]
-
-MALATTIA_TRIGGERS = [
-    "malattia", "ammal", "certificat", "certificato", "inps",
-    "comporto", "prognosi", "ricaduta",
-    "visita fiscale", "controllo", "reperibil", "fasce",
-    "assenza per malattia", "indennità", "indennita", "trattamento economico",
-    "ospedal", "ricovero", "day hospital",
-    "infortunio", "infortun",
-    "malattia durante ferie", "mi ammalo in ferie",
+    "malattia", "infortunio", "aspettativa",
+    "conservazione del posto", "diritto alla conservazione del posto",
 ]
 
 PERMESSI_TRIGGERS = [
-    "permess", "permesso", "permessi", "retribuit", "assenze retribuite",
-    "visita medica", "visite mediche", "medico", "specialista",
-    "lutto", "matrimonio", "nozze",
-    "studio", "formazione", "esami",
-    "104", "legge 104", "handicap",
-    "donazione sangue", "donazione",
-    "sindacal", "assemblea", "rsu",
-    "rol", "ex festiv", "ex-festiv", "exfestiv", "festivit", "festività",
+    "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
+    "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami", "formazione",
+    "104", "assemblea", "sindac", "donazione", "rol", "ex festiv", "festività soppresse", "festivita soppresse",
+    "festività abolite", "festivita abolite",
 ]
 
-ROL_TRIGGERS = [
-    "rol", "r.o.l", "riduzione orario", "riduzione dell'orario", "riduzione orario di lavoro",
-    "ex festiv", "ex-festiv", "exfestiv", "ex festività", "ex-festività", "ex festivita",
-    "festività soppresse", "festivita soppresse", "festività abolite", "festivita abolite",
-    "permessi rol", "ore rol", "giorni rol",
-    "quanti rol", "quante ore rol", "quanto rol",
-    "quante ex festività", "quante ex festivita", "quante festività soppresse",
+ROL_EXFEST_TRIGGERS = [
+    "rol", "r.o.l", "riduzione orario",
+    "ex festiv", "ex-festiv", "exfestiv",
+    "festività soppresse", "festivita soppresse",
+    "festività abolite", "festivita abolite",
+    "festività infrasettimanali", "festivita infrasettimanali",
+    "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
 ]
 
-IPZS_TRIGGERS = [
-    "ipzs", "poligrafico", "zecca", "azienda", "accordo aziendale", "accordi aziendali",
-    "ordine di servizio", "ods", "turni", "reparto", "linea", "impianto",
+MALATTIA_TRIGGERS = [
+    "malattia", "certificato", "certificat", "inps",
+    "comporto", "prognosi", "ricaduta",
+    "visita fiscale", "reperibil", "fasce",
+    "ricovero", "day hospital",
+    "infortunio",
 ]
 
-# =========================
-# Super-modulo permessi: categorie + copertura
-# =========================
+STRAORDINARI_TRIGGERS = [
+    "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
+    "notturno", "festivo", "supplementare"
+]
+
+# ✅ UPGRADE: differenza paga / arretrati / differenze retributive
+DIFF_PAGA_TRIGGERS = [
+    "differenza paga", "differenze paga",
+    "differenza retrib", "differenze retrib",
+    "arretrati", "arretrato",
+    "conguaglio", "conguagli",
+    "adeguamento retributivo", "adeguamento stipendiale",
+    "mi devono pagare di più", "mi devono pagare di piu",
+    "mi spetta di più", "mi spetta di piu",
+    "quanto mi spetta in più", "quanto mi spetta in piu",
+    "differenze in busta paga", "busta paga differenze",
+    "riconoscimento economico", "riconoscimento retributivo",
+]
+
+
+def is_mansioni_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in MANSIONI_TRIGGERS)
+
+def is_conservazione_context(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in CONSERVAZIONE_TRIGGERS)
+
+def is_permessi_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in PERMESSI_TRIGGERS)
+
+def is_rol_exfest_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in ROL_EXFEST_TRIGGERS)
+
+def is_malattia_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in MALATTIA_TRIGGERS)
+
+def is_straordinario_notturno_question(q: str) -> bool:
+    ql = q.lower()
+    return ("straordin" in ql) and ("notturn" in ql)
+
+def is_lavoro_notturno_question(q: str) -> bool:
+    ql = q.lower()
+    # lavoro notturno "ordinario": notturno ma NON straordinario
+    return ("notturn" in ql) and ("straordin" not in ql)
+
+def is_diff_paga_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in DIFF_PAGA_TRIGGERS)
+
+
+# ============================================================
+# PERMESSI: CATEGORIE (coverage)
+# ============================================================
 PERMESSI_CATEGORIES = {
-    "visite_mediche": [r"visite?\s+med", r"visita\s+med", r"accertament", r"specialist", r"struttur[ae]\s+sanitar"],
-    "lutto": [r"\blutto\b", r"decesso", r"grave\s+lutto", r"familiare"],
+    "rol_exfest": [r"\brol\b", r"riduzione\s+orario", r"festivit", r"soppresse", r"abolite"],
+    "visite_mediche": [r"visite?\s+med", r"specialist", r"accertament", r"struttur[ae]\s+sanitar"],
+    "lutto": [r"\blutto\b", r"decesso", r"familiare", r"grave\s+lutto"],
     "matrimonio": [r"matrimon", r"nozz"],
     "studio_formazione": [r"diritto\s+allo\s+studio", r"\b150\s+ore\b", r"\bstudio\b", r"\besami\b", r"formazion"],
     "legge_104": [r"\b104\b", r"legge\s*104", r"handicap"],
@@ -192,9 +359,9 @@ PERMESSI_CATEGORIES = {
     "altri_permessi": [r"permessi?\s+retribuit", r"assenze?\s+retribuit", r"conged"],
 }
 
-def permessi_category_coverage(selected_chunks) -> tuple[int, list[str]]:
+def permessi_category_coverage(chunks: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
+    joined = " ".join([(c.get("text") or "") for c in chunks]).lower()
     found = set()
-    joined = " ".join([(c.get("text", "") or "") for c in selected_chunks]).lower()
     for cat, pats in PERMESSI_CATEGORIES.items():
         for p in pats:
             if re.search(p, joined, flags=re.IGNORECASE):
@@ -202,9 +369,10 @@ def permessi_category_coverage(selected_chunks) -> tuple[int, list[str]]:
                 break
     return len(found), sorted(found)
 
-def build_permessi_expansion_queries(user_q: str) -> list[str]:
+def build_permessi_expansion_queries(user_q: str) -> List[str]:
     base = user_q.strip()
-    return [
+    qs = [
+        f"{base} ROL festività soppresse abolite riposi retribuiti",
         f"{base} permessi visite mediche retribuiti",
         f"{base} permessi lutto retribuiti",
         f"{base} permessi matrimonio retribuiti",
@@ -213,48 +381,26 @@ def build_permessi_expansion_queries(user_q: str) -> list[str]:
         f"{base} permessi diritto allo studio 150 ore",
         f"{base} permessi donazione sangue",
         f"{base} assenze retribuite elenco tipologie",
-    ][:MAX_MULTI_QUERIES]
+    ]
+    # unique + limit
+    out, seen = [], set()
+    for x in qs:
+        x = x.strip()
+        if x and x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out[:MAX_MULTI_QUERIES]
 
-# =========================
-# Classificatori
-# =========================
-def is_mansioni_superiori_question(user_q: str) -> bool:
-    ql = user_q.lower()
-    return any(t in ql for t in MANSIONI_ALTE_TRIGGERS)
 
-def is_diff_paga_question(user_q: str) -> bool:
-    ql = user_q.lower()
-    return any(t in ql for t in DIFF_PAGA_TRIGGERS)
-
-def is_malattia_question(user_q: str) -> bool:
-    ql = user_q.lower()
-    return any(t in ql for t in MALATTIA_TRIGGERS)
-
-def is_permessi_question(user_q: str) -> bool:
-    ql = user_q.lower()
-    return any(t in ql for t in PERMESSI_TRIGGERS)
-
-def is_rol_question(user_q: str) -> bool:
-    ql = user_q.lower()
-    return any(t in ql for t in ROL_TRIGGERS)
-
-def is_ipzs_context(user_q: str) -> bool:
-    ql = user_q.lower()
-    return any(t in ql for t in IPZS_TRIGGERS)
-
-# =========================
-# MEMORIA BREVE (domanda arricchita)
-# =========================
+# ============================================================
+# MEMORIA BREVE
+# ============================================================
 def build_enriched_question(current_q: str) -> str:
     if "messages" not in st.session_state:
         return current_q.strip()
 
     user_msgs = [m["content"] for m in st.session_state.messages if m.get("role") == "user" and m.get("content")]
-    if user_msgs and user_msgs[-1].strip() == current_q.strip():
-        prev = user_msgs[:-1]
-    else:
-        prev = user_msgs
-
+    prev = user_msgs[:-1] if (user_msgs and user_msgs[-1].strip() == current_q.strip()) else user_msgs
     last = prev[-MEMORY_USER_TURNS:] if prev else []
     last = [x.strip() for x in last if x.strip()]
     if not last:
@@ -267,114 +413,99 @@ def build_enriched_question(current_q: str) -> str:
         + current_q.strip()
     )
 
-# =========================
-# Multi-query principale
-# =========================
-def build_queries(q: str) -> list[str]:
+
+# ============================================================
+# QUERY BUILDER (multi-query)
+# ============================================================
+def build_queries(q: str) -> List[str]:
     q0 = q.strip()
-    qs = [q0]
     qlow = q0.lower()
 
-    qs += [
-        f"{q0} CCNL",
-        f"{q0} regole condizioni",
-        f"{q0} definizione procedura",
-    ]
+    qs = [q0, f"{q0} CCNL", f"{q0} regole condizioni", f"{q0} definizione procedura"]
 
-    user_is_rol = is_rol_question(q0)
+    user_is_rol = is_rol_exfest_question(q0)
     user_is_perm = is_permessi_question(q0)
     user_is_mal = is_malattia_question(q0)
-    user_is_mans = is_mansioni_superiori_question(q0)
+    user_is_mans = is_mansioni_question(q0)
+    user_is_conserv = is_conservazione_context(q0)
     user_is_diff = is_diff_paga_question(q0)
-    user_is_conserv = any(t in qlow for t in CONSERVAZIONE_TRIGGERS)
 
-    # ✅ DIFFERENZA PAGA: aggancio forte a mansioni superiori / trattamento economico
-    if user_is_diff:
-        qs += [
-            "differenze retributive mansioni superiori trattamento economico corrispondente",
-            "trattamento economico corrispondente all'attività svolta mansioni superiori",
-            "assegnazione mansioni superiori diritto alla retribuzione corrispondente",
-            "arretrati differenze retributive mansioni superiori",
-            "passaggio livello categoria mansioni superiori retribuzione",
-        ]
-
-    # ROL / ex festività
+    # ========== ROL / ex festività (terminologia corretta) ==========
+    # Nota: nel CCNL potrebbe NON esistere la parola "ex festività"
     if user_is_rol:
         qs += [
             "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
-            "ex festività festività soppresse permessi ore giorni spettanti",
-            "permessi ROL ed ex festività: quanti, come maturano e come si usano",
-            "ROL ex festività richiesta fruizione preavviso eventuale programmazione",
-            "ROL ex festività residui scadenze eventuale monetizzazione (se prevista)",
-            "permessi annui retribuiti riduzione orario (ROL) ex festività",
+            "festività soppresse abolite riposi retribuiti quanti giorni",
+            "festività infrasettimanali abolite riposi retribuiti",
+            "riposi retribuiti in sostituzione delle festività abolite",
+            "modalità richiesta fruizione ROL e riposi festività abolite preavviso programmazione",
+            "residui ROL scadenze eventuale monetizzazione (se prevista)",
         ]
 
-    # Permessi generici (non ROL)
-    elif user_is_perm:
+    # ========== Permessi generici (inclusi ROL/ex-fest se chiesto) ==========
+    if user_is_perm and (not user_is_rol):
         qs += [
             "permessi retribuiti tipologie CCNL elenco completo",
-            "assenze retribuite tipologie (visite mediche, lutto, matrimonio, 104, sindacali, studio, donazione sangue)",
-            "permessi per visite mediche come funzionano",
-            "permessi per lutto matrimonio",
-            "permessi legge 104",
+            "assenze retribuite tipologie visite mediche lutto matrimonio 104 sindacali studio donazione sangue",
             "permessi sindacali assemblea ore retribuite",
-            "permessi per studio esami 150 ore triennio",
-            "permessi donazione sangue",
+            "diritto allo studio 150 ore triennio permessi retribuiti",
+            "permessi per esami lavoratori studenti una settimana di calendario all'anno",
+        ]
+        # Aggancio sinonimi “ex festività” anche qui, perché spesso lo chiedono dentro "permessi"
+        qs += [
+            "ROL riduzione orario di lavoro riposi retribuiti",
+            "festività soppresse abolite riposi retribuiti",
         ]
 
-    # Malattia
+    # ========== Malattia ==========
     if user_is_mal:
         qs += [
             "malattia trattamento economico percentuali integrazione",
             "malattia periodo di comporto regole conteggio",
             "malattia obblighi comunicazione certificazione",
             "controlli visite fiscali reperibilità fasce",
-            "malattia durante ferie sospensione ferie se certificata",
+            "malattia durante ferie sospensione ferie",
             "ricovero ospedaliero day hospital ricaduta",
         ]
 
-    # Ferie
-    if any(k in qlow for k in ["ferie", "residu", "matur", "programmaz", "chiusura"]):
+    # ========== Straordinari / notturno ==========
+    if any(t in qlow for t in STRAORDINARI_TRIGGERS):
         qs += [
-            "ferie giorni spettanti maturazione fruizione frazionamento",
-            "residui ferie termini regole",
-            "malattia durante ferie cosa succede",
+            "lavoro straordinario maggiorazioni limiti",
+            "straordinario notturno maggiorazione percentuale",
+            "lavoro notturno maggiorazione percentuale",
+            "notturno ordinario trattamento economico",
+            "lavoro festivo maggiorazioni",
         ]
 
-    # Straordinari / notturno
-    if any(k in qlow for k in ["straordin", "maggior", "notturn", "festiv", "banca ore"]):
+    # ========== Mansioni superiori / categoria ==========
+    if user_is_mans or user_is_conserv:
         qs += [
-            "lavoro straordinario maggiorazioni limiti autorizzazione",
-            "straordinario notturno festivo maggiorazioni",
-            "lavoro notturno maggiorazione (non straordinario) percentuale",
-            "banca ore recuperi straordinario se previsti",
-        ]
-
-    # Trasferimenti / trasferte
-    if any(k in qlow for k in ["trasfer", "trasferta", "spostamento", "mobilità", "sede"]):
-        qs += [
-            "trasferimento regole preavviso tutele",
-            "trasferta indennità rimborsi spese",
-        ]
-
-    # Livelli / inquadramento
-    if any(k in qlow for k in ["livell", "inquadr", "qualifica", "categoria", "passaggio"]):
-        qs += [
-            "classificazione livelli inquadramento criteri",
-            "passaggi di livello avanzamenti regole",
-        ]
-
-    # Mansioni superiori / sostituzioni (anche per differenza paga)
-    if user_is_mans or user_is_conserv or user_is_diff:
-        qs += [
-            "mansioni superiori posto vacante",
-            "assegnazione a mansioni superiori regole generali",
-            "mansioni superiori 30 giorni consecutivi 60 discontinui",
+            "mansioni superiori regole generali posto vacante",
+            "mansioni superiori 30 giorni consecutivi 60 giorni discontinui",
+            "assegnazione a mansioni superiori effetti inquadramento",
             "non si applica in caso di sostituzione di dipendente assente con diritto alla conservazione del posto",
-            "formazione addestramento affiancamento non costituisce mansioni superiori",
             "trattamento economico durante mansioni superiori",
+            "formazione addestramento affiancamento non costituisce mansioni superiori",
         ]
 
+    # ✅ UPGRADE: Differenza paga / arretrati / differenze retributive
+    if user_is_diff:
+        qs += [
+            "differenze retributive trattamento economico corrispondente all'attività svolta",
+            "trattamento economico corrispondente all'attività svolta mansioni superiori",
+            "differenze retributive mansioni superiori arretrati conguaglio",
+            "arretrati conguaglio differenze busta paga mansioni superiori",
+            "riconoscimento economico trattamento retributivo per mansioni superiori",
+            "retribuzione dovuta in caso di mansioni superiori",
+        ]
+        # spesso è collegata a mansioni superiori, quindi aggancio anche 30/60 + posto vacante
+        qs += [
+            "mansioni superiori 30 giorni consecutivi 60 giorni discontinui trattamento economico",
+            "posto vacante mansioni superiori trattamento economico",
+        ]
+
+    # Unique + limit
     out, seen = [], set()
     for x in qs:
         x = x.strip()
@@ -383,463 +514,389 @@ def build_queries(q: str) -> list[str]:
             seen.add(x)
     return out[:MAX_MULTI_QUERIES]
 
-# =========================
-# Evidence extraction
-# =========================
-def extract_key_evidence(chunks):
-    """
-    chunks: list[dict] con chiavi page/text (robusto anche se arrivano stringhe)
-    """
-    evidences = []
+
+# ============================================================
+# EVIDENCE EXTRACTION (robusta)
+# ============================================================
+def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
     patterns = [
-        r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"\b%\b",
+        r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"%",
+
+        r"retribuzion", r"trattamento\s+econom", r"trattamento\s+retribut",
+        r"differenz", r"arretrat", r"conguagli",
+
         r"posto\s+vacante", r"mansioni?\s+superiori?", r"sostituzion",
         r"conservazion.*posto", r"diritto.*conservazion.*posto",
         r"non\s+si\s+applica", r"non\s+costituisc",
-        r"formazion", r"addestrament", r"affiancament",
-        r"trattamento\s+econom", r"trattamento\s+retribut", r"retribuzion", r"differenz",
+        r"affiancament", r"addestrament", r"formazion",
+        r"\brol\b", r"riduzione\s+orario",
+        r"festivit", r"soppresse", r"abolite", r"infrasettimanali",
+        r"notturn", r"straordin", r"maggior",
+        r"permess", r"assenze?\s+retribuit",
+        r"assemblea", r"sindacal", r"\b104\b",
+        r"diritto\s+allo\s+studio", r"\b150\s+ore\b",
         r"malatt", r"comporto", r"certificat", r"reperibil", r"visita\s+fiscale",
-        r"permess", r"\brol\b", r"riduzione\s+orario", r"ex\s*fest", r"festivit",
-        r"lutto", r"matrimon", r"nozz", r"\b104\b", r"sindacal", r"assemblea",
-        r"\b3\s*mesi\b", r"tre\s+mesi",
     ]
 
-    def line_is_interesting(ln_low: str) -> bool:
-        return any(re.search(p, ln_low) for p in patterns)
-
+    evidences: List[str] = []
     for c in chunks:
-        # robustezza: se per qualche motivo arriva una stringa
-        if isinstance(c, str):
-            page = "?"
-            text = c
-        else:
-            page = c.get("page", "?")
-            text = c.get("text", "")
-
-        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        page = c.get("page", "?")
+        text = c.get("text", "") or ""
+        # Split lines
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         for ln in lines:
             ln_low = ln.lower()
-            if line_is_interesting(ln_low):
+            if any(re.search(p, ln_low) for p in patterns):
                 ln_clean = " ".join(ln.split())
                 if 20 <= len(ln_clean) <= 420:
                     evidences.append(f"(pag. {page}) {ln_clean}")
 
+    # unique
     out, seen = [], set()
     for e in evidences:
         if e not in seen:
             out.append(e)
             seen.add(e)
-    return out[:18]
+    return out[:MAX_EVIDENCE_LINES]
 
-def evidence_has_30_60(evidence_lines: list[str]) -> bool:
+
+def evidence_has_30_60(evidence_lines: List[str]) -> bool:
     joined = " ".join(evidence_lines).lower()
     return (re.search(r"\b30\b", joined) is not None) and (re.search(r"\b60\b", joined) is not None)
 
-def evidence_mentions_three_months(evidence_lines: list[str]) -> bool:
-    joined = " ".join(evidence_lines).lower()
-    return ("tre mesi" in joined) or (re.search(r"\b3\s*mesi\b", joined) is not None)
 
-def text_mentions_three_months(txt: str) -> bool:
-    t = (txt or "").lower()
-    return ("tre mesi" in t) or (re.search(r"\b3\s*mesi\b", t) is not None)
+# ============================================================
+# OPTIONAL BM25 RERANK (precision boost)
+# ============================================================
+def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not BM25_AVAILABLE or not candidates:
+        return candidates
 
-# =========================
-# Index build/load (robusto)
-# =========================
-def build_index():
-    if not os.path.exists(PDF_PATH):
-        raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti 'ccnl.pdf' in /documenti)")
+    # tokenize naive
+    corpus = [(c.get("text") or "").lower().split() for c in candidates]
+    bm25 = BM25Okapi(corpus)
+    scores = bm25.get_scores(query.lower().split())
+    idx = np.argsort(-np.array(scores))  # descending
+    return [candidates[int(i)] for i in idx]
 
-    os.makedirs(INDEX_DIR, exist_ok=True)
 
-    loader = PyPDFLoader(PDF_PATH)
-    docs = loader.load()
+# ============================================================
+# SYSTEM RULES (core)
+# ============================================================
+RULES = """
+Sei l’assistente UILCOM per lavoratori IPZS.
+Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto (estratti CCNL) fornito.
+Non inventare informazioni.
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=150)
-    chunks = splitter.split_documents(docs)
+REGOLE IMPORTANTI:
+1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nel CCNL caricato."
 
-    texts = [c.page_content for c in chunks]
-    pages = [(c.metadata.get("page", 0) + 1) for c in chunks]  # numero foglio PDF
+2) DIFFERENZA PAGA / ARRETRATI:
+   - Non inventare importi o percentuali.
+   - Puoi dire "spetta il trattamento economico corrispondente" SOLO se nel contesto c'è una frase che lo prevede.
+   - Se l’utente chiede "quanto mi spetta" e nel CCNL non ci sono cifre/criteri specifici nel contesto recuperato,
+     devi dire chiaramente che l’importo non è determinabile dal CCNL recuperato e che serve busta paga/accordi aziendali/HR.
 
-    emb = OpenAIEmbeddings()
-    vectors = emb.embed_documents(texts)
-    vectors = np.array(vectors, dtype=np.float32)
+3) NON confondere lavoro notturno con straordinario notturno:
+   - Se la domanda è "lavoro notturno" (ordinario), usa solo regole/percentuali del notturno ordinario.
+   - Se nel contesto trovi solo "straordinario notturno", devi dirlo e NON applicarlo al notturno ordinario.
 
-    np.save(VEC_PATH, vectors)
+4) MANSIONI SUPERIORI / CATEGORIA:
+   - Se nel contesto emergono 30 giorni consecutivi / 60 giorni non consecutivi, questi vanno riportati.
+   - Se nel contesto emerge la distinzione posto vacante vs sostituzione con conservazione del posto, riportala chiaramente.
 
-    with open(META_PATH, "w", encoding="utf-8") as f:
-        json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
+5) TERMINOLOGIA EX FESTIVITÀ:
+   - Se l’utente dice "ex festività" ma nel CCNL trovi "festività soppresse/abolite/infrasettimanali abolite",
+     spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
 
-    return len(chunks)
+6) Permessi:
+   - Elenca SOLO le tipologie che trovi nel contesto.
+   - Se l’utente chiede "tutti i permessi", includi anche ROL/festività abolite solo se compaiono nel contesto recuperato.
 
-def load_index():
-    vectors = np.load(VEC_PATH)
-    with open(META_PATH, "r", encoding="utf-8") as f:
-        meta = json.load(f)
+7) Output: prepara una risposta pulita per l’utente (senza citare pagine).
+   Le pagine/estratti vanno messi SOLO nella sezione ADMIN.
 
-    # robustezza: se per qualche motivo chunks.json contiene lista di stringhe
-    if isinstance(meta, list) and meta and isinstance(meta[0], str):
-        meta = [{"page": "?", "text": s} for s in meta]
-    # robustezza: se ci sono elementi non-dict
-    if isinstance(meta, list):
-        fixed = []
-        for it in meta:
-            if isinstance(it, dict):
-                fixed.append({"page": it.get("page", "?"), "text": it.get("text", "")})
-            else:
-                fixed.append({"page": "?", "text": str(it)})
-        meta = fixed
+FORMATO OUTPUT OBBLIGATORIO:
 
-    return vectors, meta
+<PUBLIC>
+...testo per l’utente...
+</PUBLIC>
 
-# =========================
-# UILCOM rules (super precisione + differenza paga)
-# =========================
-rules = (
-    "Sei l’assistente UILCOM per lavoratori IPZS. "
-    "Rispondi in modo chiaro, professionale e pratico basandoti SOLO sul contesto del CCNL fornito. "
-    "Non inventare informazioni.\n\n"
+<ADMIN>
+- Evidenze: ...
+- Pagine/chunk usati: ...
+</ADMIN>
+"""
 
-    "REGOLA PROVA: puoi elencare una categoria (es. lutto, visite mediche, 104, matrimonio, sindacali, donazione sangue, studio) "
-    "SOLO se nel contesto recuperato c'è almeno un riferimento testuale. "
-    "Se non emerge dal contesto, NON affermare che esiste.\n\n"
 
-    "OBBLIGO NUMERI E LIMITAZIONI: se nel contesto compaiono soglie numeriche o frasi di esclusione/limitazione "
-    "(es. 'non si applica', 'non costituisce', 'sostituzione', 'diritto alla conservazione del posto', 'affiancamento/formazione'), "
-    "riportale esplicitamente.\n\n"
-
-    "MODULO DIFFERENZA PAGA (IMPORTANTISSIMO): se l’utente chiede 'differenza paga', 'mi devono pagare di più', 'arretrati', "
-    "'adeguamento retributivo', devi cercare nel contesto i passaggi su: "
-    "(1) 'trattamento economico/retributivo corrispondente all’attività svolta' durante mansioni superiori, "
-    "(2) quando scatta/consolida l’assegnazione (30 giorni consecutivi / 60 discontinui se presenti), "
-    "(3) esclusione in caso di sostituzione di assente con diritto alla conservazione del posto, "
-    "(4) se mancano importi o percentuali nel CCNL, dichiaralo e NON inventare cifre.\n\n"
-
-    "MODULO MALATTIA: quando la domanda riguarda la malattia, se presenti nel contesto includi SEMPRE: "
-    "(1) trattamento economico/percentuali, (2) periodo di comporto e conteggio, (3) obblighi certificazione/comunicazione, "
-    "(4) eventuali controlli/reperibilità, (5) casi particolari. "
-    "Se una voce non emerge dal contesto, dillo.\n\n"
-
-    "SUPER MODULO PERMESSI: quando la domanda riguarda 'permessi retribuiti' in generale (oltre a ROL/ex festività), "
-    "devi cercare e riassumere PIÙ categorie (non una sola) ma SOLO se emergono dal contesto.\n\n"
-
-    "FIX ROL/EX FESTIVITÀ: se l’utente chiede ROL o ex festività, "
-    "rispondi su ROL/ex festività e NON confondere con permessi studio.\n\n"
-
-    "REGOLA CHIAVE (SOSTITUZIONI): se la domanda riguarda la sostituzione di un lavoratore assente con diritto alla conservazione del posto "
-    "(es. maternità, infortunio, malattia, aspettativa), specifica che la regola delle mansioni superiori NON si applica "
-    "ai fini dell’inquadramento definitivo, se ciò risulta dal contesto.\n\n"
-
-    "PRIORITÀ NORMATIVA (MANSIONI SUPERIORI): se nel contesto sono presenti le soglie 30 giorni consecutivi / 60 discontinui, "
-    "queste hanno priorità. Non sostituirle con altre durate se non chiaramente collegate.\n\n"
-
-    "Se non trovi la risposta, scrivi: 'Non ho trovato la risposta nel CCNL caricato'.\n\n"
-
-    "CONSIGLIO PRATICO: alla fine inserisci sempre una sezione 'Consiglio pratico UILCOM' con 1–2 bullet operativi (brevi). "
-    "Non dare consigli legali personalizzati.\n"
-)
-
-# =========================
-# Sidebar
-# =========================
-with st.sidebar:
-    st.header("⚙️ Controlli")
-
-    ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
-    st.write("📦 Indice presente:", "✅" if ok_index else "❌")
-
-    if st.button("Indicizza CCNL (prima volta / dopo cambio PDF)"):
-        try:
-            with st.spinner("Indicizzazione in corso..."):
-                n = build_index()
-            st.success(f"Indicizzazione completata! Chunk creati: {n}")
-        except Exception as e:
-            st.error(str(e))
-
-    if st.button("🧹 Nuova chat"):
-        st.session_state.messages = []
-        st.rerun()
-
-    if st.session_state.admin_ok:
-        st.divider()
-        st.caption("Admin: debug attivo (visibile solo a te).")
-
-# =========================
-# Chat UI (tipo ChatGPT)
-# =========================
+# ============================================================
+# CHAT STATE
+# ============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Render chat (pulita)
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
-
-        # Fonti/Debug SOLO admin
-        if st.session_state.admin_ok and m["role"] == "assistant" and m.get("sources"):
-            with st.expander("📚 Fonti CCNL (solo admin)"):
-                for s in m["sources"]:
-                    if isinstance(s, dict):
-                        st.write(f"**Foglio PDF {s.get('page', '?')}**")
-                        txt = s.get("text", "")
-                        st.write(txt[:900] + ("..." if len(txt) > 900 else ""))
+        # Admin-only debug for assistant messages
+        if st.session_state.is_admin and m["role"] == "assistant":
+            dbg = m.get("debug", None)
+            if dbg:
+                with st.expander("🧠 Admin: Query / Evidenze / Chunk (debug)", expanded=False):
+                    st.write("**Domanda arricchita (memoria breve):**")
+                    st.code(dbg.get("enriched_q", ""))
+                    st.write("**Query usate:**")
+                    st.code("\n".join(dbg.get("queries", [])))
+                    st.write("**Evidenze estratte:**")
+                    st.code("\n".join(dbg.get("evidence", [])) or "(nessuna)")
+                    st.write("**Chunk selezionati (prime righe):**")
+                    for c in dbg.get("selected", []):
+                        st.write(f"**Pagina {c.get('page')}**")
+                        txt = (c.get("text") or "")
+                        st.write(txt[:800] + ("..." if len(txt) > 800 else ""))
                         st.divider()
-                    else:
-                        st.write(str(s)[:900])
-                        st.divider()
 
-        if st.session_state.admin_ok and m["role"] == "assistant" and m.get("debug"):
-            with st.expander("🧠 Debug retrieval (solo admin)"):
-                st.json(m["debug"])
 
-user_input = st.chat_input("Scrivi una domanda sul CCNL (ferie, malattia, permessi, straordinari, livelli...)")
+user_input = st.chat_input("Scrivi una domanda sul CCNL (permessi, ROL/festività soppresse, malattia, straordinari, categorie...)")
 
-if user_input:
+if not user_input:
+    st.stop()
+
+# Require index
+if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
     st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": "Prima devo indicizzare il CCNL: apri la barra laterale e clicca **Indicizza / Reindicizza CCNL**.",
+    })
+    st.rerun()
 
-    if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
-        msg = "Prima devo indicizzare il CCNL: apri il menu a sinistra e clicca **Indicizza CCNL**."
-        st.session_state.messages.append({"role": "assistant", "content": msg, "sources": []})
-        st.rerun()
+# Append user msg
+st.session_state.messages.append({"role": "user", "content": user_input})
 
-    enriched_q = build_enriched_question(user_input)
 
-    vectors, meta = load_index()
-    mat_norm = normalize_rows(vectors)
-    emb = OpenAIEmbeddings()
+# ============================================================
+# RETRIEVAL PIPELINE
+# ============================================================
+enriched_q = build_enriched_question(user_input)
 
-    user_is_mans = is_mansioni_superiori_question(enriched_q)
-    user_is_diff = is_diff_paga_question(enriched_q)
-    user_is_mal = is_malattia_question(enriched_q)
-    user_is_perm = is_permessi_question(enriched_q)
-    user_is_rol = is_rol_question(enriched_q)
-    user_mentions_ipzs = is_ipzs_context(enriched_q)
+vectors, meta = load_index()
+mat_norm = normalize_rows(vectors)
+emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
-    # =========================
-    # Pass 1 retrieval
-    # =========================
-    queries = build_queries(enriched_q)
+queries = build_queries(enriched_q)
 
-    scores_best = {}
-    debug_top = []
+# Multi-query semantic retrieval
+scores_best: Dict[int, float] = {}
 
-    for q in queries:
-        qvec = np.array(emb.embed_query(q), dtype=np.float32)
-        sims = cosine_scores(qvec, mat_norm)
-        top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
-        debug_top.append({"query": q, "top_idx": top_idx[:5].tolist()})
+for q in queries:
+    qvec = np.array(emb.embed_query(q), dtype=np.float32)
+    sims = cosine_scores(qvec, mat_norm)
+    top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
+    for i in top_idx:
+        s = float(sims[int(i)])
+        if (int(i) not in scores_best) or (s > scores_best[int(i)]):
+            scores_best[int(i)] = s
 
-        for i in top_idx:
-            s = float(sims[i])
-            if (i not in scores_best) or (s > scores_best[i]):
-                scores_best[i] = s
+provisional_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
+provisional_selected = [meta[i] for i in provisional_idx]
+provisional_evidence = extract_key_evidence(provisional_selected)
 
-    provisional_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
-    provisional_selected = [meta[i] for i in provisional_idx]
-    provisional_evidence = extract_key_evidence(provisional_selected)
+# Guardrail: permessi coverage pass 2
+user_is_perm = is_permessi_question(enriched_q)
+user_is_rol = is_rol_exfest_question(enriched_q)
 
-    # Guardrail 30/60 mansioni
-    guardrail_30_60 = evidence_has_30_60(provisional_evidence) and (user_is_mans or user_is_diff)
+if user_is_perm and (not user_is_rol):
+    cov_n, _ = permessi_category_coverage(provisional_selected)
+    if cov_n < PERMESSI_MIN_CATEGORY_COVERAGE:
+        extra_queries = build_permessi_expansion_queries(enriched_q)
+        for q in extra_queries:
+            qvec = np.array(emb.embed_query(q), dtype=np.float32)
+            sims = cosine_scores(qvec, mat_norm)
+            top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
+            for i in top_idx:
+                s = float(sims[int(i)])
+                if (int(i) not in scores_best) or (s > scores_best[int(i)]):
+                    scores_best[int(i)] = s
 
-    # =========================
-    # SUPER PASS 2 (solo permessi generici): se copertura bassa, rilanciamo query per categorie
-    # =========================
-    perm_guardrail_note = ""
-    if user_is_perm and (not user_is_rol):
-        cov_n, _ = permessi_category_coverage(provisional_selected)
-        if cov_n < PERMESSI_MIN_CATEGORY_COVERAGE:
-            extra_queries = build_permessi_expansion_queries(enriched_q)
-            for q in extra_queries:
-                qvec = np.array(emb.embed_query(q), dtype=np.float32)
-                sims = cosine_scores(qvec, mat_norm)
-                top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
-                for i in top_idx:
-                    s = float(sims[i])
-                    if (i not in scores_best) or (s > scores_best[i]):
-                        scores_best[i] = s
+# Re-ranking with domain boosts (fix mansioni + notturno + diff paga)
+user_is_mans = is_mansioni_question(enriched_q) or ("categoria" in enriched_q.lower())
+user_is_conserv = is_conservazione_context(enriched_q)
+user_is_notturno = is_lavoro_notturno_question(enriched_q)
+user_is_straord_notturno = is_straordinario_notturno_question(enriched_q)
 
-            perm_guardrail_note = (
-                "\nGUARDRAIL PERMESSI: la domanda è generale sui permessi retribuiti. "
-                "Devi riportare SOLO le categorie che emergono dal contesto. "
-                "Se una categoria non emerge, dichiaralo come 'Non emerso dal CCNL recuperato'.\n"
-            )
+# ✅ differenza paga
+user_is_diff = is_diff_paga_question(enriched_q)
 
-    # =========================
-    # Re-ranking con boost (precisione)
-    # =========================
-    for i in list(scores_best.keys()):
-        txt = (meta[i].get("text", "") or "").lower()
-        boost = 0.0
+# If mansioni and we saw 30/60 in evidence, prioritize those chunks
+force_30_60 = evidence_has_30_60(provisional_evidence) and user_is_mans
 
-        # Mansioni superiori / differenza paga: super boost su trattamento economico + 30/60 + esclusioni
-        if user_is_mans or user_is_diff:
-            if "trattamento econom" in txt or "trattamento retribut" in txt or "retribuzion" in txt or "differenz" in txt:
-                boost += 0.10
-            if re.search(r"\b30\b", txt) and re.search(r"\b60\b", txt):
-                boost += 0.14
-            if "non si applica" in txt or "non si applicano" in txt:
-                boost += 0.07
-            if "conservazione del posto" in txt or "diritto alla conservazione" in txt:
-                boost += 0.06
-            if "affianc" in txt or "formaz" in txt or "addestr" in txt:
-                boost += 0.03
-            if "posto vacante" in txt:
-                boost += 0.04
-            if guardrail_30_60 and text_mentions_three_months(txt):
-                boost -= 0.12
+for i in list(scores_best.keys()):
+    txt = (meta[i].get("text") or "").lower()
+    boost = 0.0
 
-        # Malattia
-        if user_is_mal:
-            if "comporto" in txt:
-                boost += 0.08
-            if "malatt" in txt:
-                boost += 0.05
-            if "%" in txt or "percent" in txt or "trattamento econom" in txt:
-                boost += 0.05
-            if "certificat" in txt or "comunicaz" in txt:
-                boost += 0.04
-            if "reperibil" in txt or "visita fiscale" in txt:
-                boost += 0.04
+    # Mansioni superiori boosts
+    if user_is_mans or user_is_conserv:
+        if re.search(r"\b30\b", txt) and re.search(r"\b60\b", txt):
+            boost += 0.18
+        if "posto vacante" in txt:
+            boost += 0.08
+        if "conservazione del posto" in txt or "diritto alla conservazione" in txt:
+            boost += 0.08
+        if "non si applica" in txt or "non si applicano" in txt:
+            boost += 0.07
+        if "affianc" in txt or "formaz" in txt or "addestr" in txt:
+            boost += 0.03
 
-        # Permessi generici
-        if user_is_perm and (not user_is_rol):
-            if "permess" in txt or "assenze retribuite" in txt:
-                boost += 0.07
-            for cat, pats in PERMESSI_CATEGORIES.items():
-                for p in pats:
-                    if re.search(p, txt, flags=re.IGNORECASE):
-                        boost += 0.03
-                        break
-
-        # ROL / ex festività
-        if user_is_rol:
-            if re.search(r"\brol\b", txt) or "riduzione orario" in txt:
-                boost += 0.14
-            if "ex festiv" in txt or "festività soppresse" in txt or "festivita soppresse" in txt:
-                boost += 0.14
-            if "diritto allo studio" in txt or "150 ore" in txt:
-                boost -= 0.10
-
-        scores_best[i] = scores_best[i] + boost
-
-    final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
-    selected = [meta[i] for i in final_idx]
-
-    context = "\n\n---\n\n".join([f"[Foglio PDF {c.get('page','?')}] {c.get('text','')}" for c in selected])
-
-    key_evidence = extract_key_evidence(selected)
-    evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente: usare comunque il contesto.)"
-
-    # Guardrail note mansioni/diff paga
-    force_30_60_priority = evidence_has_30_60(key_evidence) and (user_is_mans or user_is_diff)
-    has_3_months = evidence_mentions_three_months(key_evidence) and (user_is_mans or user_is_diff)
-
-    guardrail_note = ""
-    if force_30_60_priority:
-        guardrail_note = (
-            "\nGUARDRAIL MANSIONI/DIFFERENZA PAGA: nelle evidenze compaiono 30 giorni continuativi / 60 giorni non continuativi. "
-            "Devi usare questi valori per indicare quando scatta/consolida l’assegnazione definitiva. "
-            "NON usare 'tre mesi/3 mesi' se non è nello stesso passaggio normativo sulle mansioni superiori. "
-            "Se compaiono sia 30/60 sia 3 mesi, prevale 30/60.\n"
-        )
-    elif has_3_months:
-        guardrail_note = (
-            "\nNOTA: nelle evidenze compare anche un riferimento a 'tre mesi/3 mesi'. "
-            "Usalo SOLO se nel contesto è chiaramente riferito alle mansioni superiori. "
-            "Se non è chiaro, non usarlo.\n"
-        )
-
-    rol_note = ""
+    # ROL / festività soppresse boosts
     if user_is_rol:
-        rol_note = (
-            "\nNOTA ROL/EX FESTIVITÀ: L’utente chiede ROL o ex festività. "
-            "Non parlare di permessi studio a meno che l’utente lo chieda esplicitamente. "
-            "Se non emergono numeri precisi (ore/giorni) dal contesto recuperato, dichiaralo.\n"
-        )
+        if re.search(r"\brol\b", txt) or "riduzione orario" in txt:
+            boost += 0.16
+        if "festività soppresse" in txt or "festivita soppresse" in txt or "abolite" in txt or "infrasettimanali" in txt:
+            boost += 0.16
+        # Evita confondere con studio
+        if "diritto allo studio" in txt or "150 ore" in txt:
+            boost -= 0.10
 
-    ipzs_note = ""
-    if user_mentions_ipzs:
-        ipzs_note = (
-            "\nNOTA IPZS: Se la domanda può dipendere da prassi o accordi aziendali (turni, ODS, procedure interne), "
-            "segnalalo nella risposta e nel Consiglio pratico.\n"
-        )
+    # Notturno vs straordinario notturno
+    if user_is_notturno:
+        # favorisci “lavoro notturno” e penalizza “straordinario” se la domanda è ordinaria
+        if "notturn" in txt and "straordin" not in txt:
+            boost += 0.10
+        if "straordin" in txt and "notturn" in txt:
+            boost -= 0.08
+    if user_is_straord_notturno:
+        if "straordin" in txt and "notturn" in txt:
+            boost += 0.12
 
-    perm_format_note = ""
+    # Permessi generic boosts
     if user_is_perm and (not user_is_rol):
-        perm_format_note = (
-            "\nFORMATO PERMESSI: elenca più categorie SOLO se emergono nel contesto. "
-            "Se una categoria non emerge, inseriscila in 'Non emerso dal CCNL recuperato' senza affermare che esista.\n"
-        )
+        if "permess" in txt or "assenze retribuite" in txt:
+            boost += 0.07
 
-    diff_paga_note = ""
+    # ✅ Differenza paga / arretrati boosts
     if user_is_diff:
-        diff_paga_note = (
-            "\nFOCUS DIFFERENZA PAGA: rispondi chiaramente se (e quando) spetta il trattamento economico del livello/mansione svolta. "
-            "Se il CCNL non fornisce importi/valori economici precisi, dillo esplicitamente e NON inventare cifre.\n"
-        )
+        # blocchi che parlano di trattamento economico/retribuzione/differenze
+        if ("retribuzion" in txt) or ("trattamento econom" in txt) or ("trattamento retribut" in txt):
+            boost += 0.12
+        if ("differenz" in txt) or ("arretrat" in txt) or ("conguagli" in txt) or ("conguaglio" in txt):
+            boost += 0.12
+        # spesso è legato a mansioni superiori
+        if ("mansioni superior" in txt) or ("mansione superior" in txt):
+            boost += 0.06
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    scores_best[i] = scores_best[i] + boost
 
-    prompt = f"""
-{rules}
-{guardrail_note}
-{diff_paga_note}
-{perm_guardrail_note}
-{perm_format_note}
-{rol_note}
-{ipzs_note}
+final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
+selected = [meta[i] for i in final_idx]
+
+# Optional BM25 rerank for final precision
+selected = bm25_rerank(enriched_q, selected)
+
+# Build context for LLM
+context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
+
+key_evidence = extract_key_evidence(selected)
+evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
+
+guardrail_mansioni = ""
+if force_30_60:
+    guardrail_mansioni = (
+        "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori se parli di passaggio categoria/mansioni superiori.\n"
+    )
+
+guardrail_notturno = ""
+if user_is_notturno:
+    guardrail_notturno = (
+        "GUARDRAIL NOTTURNO: la domanda è su lavoro notturno (ordinario). NON usare percentuali di straordinario notturno.\n"
+    )
+elif user_is_straord_notturno:
+    guardrail_notturno = (
+        "GUARDRAIL STRAORD. NOTTURNO: la domanda è su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
+    )
+
+guardrail_diff_paga = ""
+if user_is_diff:
+    guardrail_diff_paga = (
+        "GUARDRAIL DIFFERENZA PAGA: l’utente chiede differenza paga/arretrati. "
+        "NON inventare importi/percentuali. Se il contesto non consente di quantificare, "
+        "spiega che l’importo non è determinabile dal CCNL recuperato.\n"
+    )
+
+# ============================================================
+# LLM CALL
+# ============================================================
+llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
+
+prompt = f"""
+{RULES}
+
+{guardrail_mansioni}
+{guardrail_notturno}
+{guardrail_diff_paga}
 
 DOMANDA (UTENTE):
 {user_input}
 
-DOMANDA ARRICCHITA (MEMORIA BREVE - per capire il contesto):
+DOMANDA ARRICCHITA (MEMORIA BREVE):
 {enriched_q}
 
-EVIDENZE OBBLIGATORIE (se presenti):
-Devi riportare esplicitamente queste regole/numeri/limitazioni nella risposta, perché sono operative.
+EVIDENZE (se presenti, sono operative):
 {evidence_block}
 
-CONTESTO (estratti CCNL):
+CONTESTO CCNL (estratti):
 {context}
 
-SCRIVI LA RISPOSTA CON QUESTA STRUTTURA:
-
-Risposta UILCOM:
-(2–5 righe)
-
-Dettagli operativi:
-(4–10 punti massimo; se c'è una esclusione/limitazione che cambia l'esito — es. conservazione del posto, "non si applica" — mettila come primo punto)
-
-Non emerso dal CCNL recuperato:
-(se serve, 0–3 bullet)
-
-Consiglio pratico UILCOM:
-(1–2 bullet operativi, brevi, coerenti)
-
-Nota UILCOM:
-Questa risposta è informativa; per casi specifici verificare con RSU/UILCOM o HR e con il testo ufficiale.
-
-RISPOSTA:
+RICORDA:
+- Nel PUBLIC: risposta pulita, senza pagine.
+- Nel ADMIN: inserisci elenco pagine trovate e 5-10 righe evidenza più importanti con (pag. X).
 """
 
-    try:
-        answer = llm.invoke(prompt).content
-    except Exception as e:
-        answer = f"Errore nel generare la risposta: {e}"
+def split_public_admin(text: str) -> Tuple[str, str]:
+    pub = ""
+    adm = ""
+    m_pub = re.search(r"<PUBLIC>(.*?)</PUBLIC>", text, flags=re.DOTALL | re.IGNORECASE)
+    m_adm = re.search(r"<ADMIN>(.*?)</ADMIN>", text, flags=re.DOTALL | re.IGNORECASE)
+    if m_pub:
+        pub = m_pub.group(1).strip()
+    else:
+        pub = text.strip()
 
-    debug_payload = None
-    if st.session_state.admin_ok:
-        debug_payload = {
-            "user_input": user_input,
-            "enriched_q": enriched_q[:5000],
-            "queries_used": queries,
-            "top_queries_preview": debug_top[:6],
-            "selected_fogli_pdf": [s.get("page", "?") for s in selected if isinstance(s, dict)],
-            "force_30_60_priority": bool(force_30_60_priority),
-            "is_diff_paga": bool(user_is_diff),
-            "is_mansioni": bool(user_is_mans),
-        }
+    if m_adm:
+        adm = m_adm.group(1).strip()
+    return pub, adm
 
-    st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": selected, "debug": debug_payload}
-    )
-    st.rerun()
+try:
+    raw = llm.invoke(prompt).content
+except Exception as e:
+    raw = f"<PUBLIC>Errore nel generare la risposta: {e}</PUBLIC><ADMIN></ADMIN>"
+
+public_ans, admin_ans = split_public_admin(raw)
+
+# Fallback: if model forgot format, enforce minimal
+if not public_ans:
+    public_ans = "Non ho trovato la risposta nel CCNL caricato."
+
+# ============================================================
+# OUTPUT (utente pulito + admin debug)
+# ============================================================
+assistant_payload: Dict[str, Any] = {
+    "role": "assistant",
+    "content": public_ans,
+}
+
+# Admin debug bundle (not visible to users)
+if st.session_state.is_admin:
+    assistant_payload["debug"] = {
+        "enriched_q": enriched_q,
+        "queries": queries,
+        "evidence": key_evidence,
+        "selected": selected,
+        "admin_llm_section": admin_ans,
+        "bm25_available": BM25_AVAILABLE,
+        "diff_paga_mode": user_is_diff,
+    }
+
+st.session_state.messages.append(assistant_payload)
+st.rerun()
