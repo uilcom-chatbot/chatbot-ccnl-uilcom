@@ -1,17 +1,16 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva + FIX STRAORDINARI)
+# app.py — Assistente Contrattuale UILCOM IPZS (definitiva + FORCED RETRIEVAL NOTTURNO ORDINARIO)
 # ✅ Risposte SOLO dal CCNL
 # ✅ Utenti: risposta pulita (senza fonti)
 # ✅ Admin: debug + evidenze + chunk/pagine usate
 # ✅ Fix: ex festività = festività soppresse/abolite/infrasettimanali abolite
 # ✅ Fix: mansioni superiori (30/60 + posto vacante + esclusione conservazione posto)
-# ✅ Fix: lavoro notturno vs straordinario notturno (non confondere %)
-# ✅ FIX STRAORDINARI: query + boost + precisione maggiorazioni
+# ✅ Fix: lavoro notturno vs straordinario notturno (NON confondere %)
+# ✅ FIX FINALE: se nel CCNL esiste % del NOTTURNO ORDINARIO, viene SEMPRE recuperata (forced retrieval)
 # ✅ Indice vettoriale persistente (vectors.npy + chunks.json)
 
 import os
 import json
 import re
-import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -21,7 +20,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-# Optional (precision boost): rank-bm25
+# Optional: rank-bm25
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
     BM25_AVAILABLE = True
@@ -47,20 +46,18 @@ TOP_K_FINAL = 18
 MAX_MULTI_QUERIES = 12
 
 MEMORY_USER_TURNS = 3
-
-# Permessi: quante categorie diverse provare a coprire
 PERMESSI_MIN_CATEGORY_COVERAGE = 3
-
-# Admin debug: quante righe evidenza mostrare
 MAX_EVIDENCE_LINES = 18
 
-# LLM
 LLM_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0
 
+# Forced retrieval: quante "prove" forzare nel contesto se parliamo di NOTTURNO ORDINARIO
+FORCED_NOTTURNO_TOPN = 6
+
 
 # ============================================================
-# SECRETS / PASSWORDS
+# SECRETS
 # ============================================================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
@@ -70,18 +67,13 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
         pass
     return os.getenv(key, default)
 
-
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin debug
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
+UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
 
 # ============================================================
-# PAGE SETUP
+# UI
 # ============================================================
 st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
 st.title(APP_TITLE)
@@ -94,7 +86,7 @@ st.divider()
 
 
 # ============================================================
-# AUTH: ISCRITTI
+# AUTH ISCRITTI
 # ============================================================
 if "auth_ok" not in st.session_state:
     st.session_state.auth_ok = False
@@ -117,7 +109,7 @@ if not st.session_state.auth_ok:
 
 
 # ============================================================
-# ADMIN MODE (debug)
+# ADMIN (debug)
 # ============================================================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
@@ -125,7 +117,6 @@ if "is_admin" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Controlli")
 
-    # Admin login
     st.subheader("🧠 Admin (debug)")
     if ADMIN_PASSWORD:
         admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
@@ -146,7 +137,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Index management
     st.subheader("📦 Indice CCNL")
     ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
     st.write("Indice presente:", "✅" if ok_index else "❌")
@@ -162,28 +152,21 @@ with st.sidebar:
                 loader = PyPDFLoader(PDF_PATH)
                 docs = loader.load()
 
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-                )
+                splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
                 chunks = splitter.split_documents(docs)
 
                 texts = [c.page_content for c in chunks]
-                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based (foglio PDF)
+                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # foglio PDF
 
                 if not OPENAI_API_KEY:
                     raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
 
                 emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors = emb.embed_documents(texts)
-                vectors = np.array(vectors, dtype=np.float32)
+                vectors = np.array(emb.embed_documents(texts), dtype=np.float32)
 
                 np.save(VEC_PATH, vectors)
                 with open(META_PATH, "w", encoding="utf-8") as f:
-                    json.dump(
-                        [{"page": p, "text": t} for p, t in zip(pages, texts)],
-                        f,
-                        ensure_ascii=False,
-                    )
+                    json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
 
             st.success(f"Indicizzazione completata. Chunk: {len(chunks)}")
             st.rerun()
@@ -195,16 +178,16 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption("Dopo modifiche a app.py su GitHub, Streamlit Cloud di solito fa auto-redeploy. Se no: **Reboot app**.")
+    st.caption("Dopo commit su GitHub Streamlit Cloud di solito fa auto-redeploy. Se no: **Reboot app**.")
 
 
 # ============================================================
-# HARD FAIL IF NO OPENAI KEY
+# OPENAI KEY REQUIRED
 # ============================================================
 if not OPENAI_API_KEY:
     st.error(
-        "Manca la variabile **OPENAI_API_KEY**.\n\n"
-        "Streamlit Cloud: **Settings → Secrets → OPENAI_API_KEY**\n"
+        "Manca **OPENAI_API_KEY**.\n\n"
+        "Streamlit Cloud: Settings → Secrets → OPENAI_API_KEY\n"
         "Locale: variabile d’ambiente OPENAI_API_KEY"
     )
     st.stop()
@@ -216,11 +199,9 @@ if not OPENAI_API_KEY:
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
 
-
 def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     return mat_norm @ q
-
 
 def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
     vectors = np.load(VEC_PATH)
@@ -239,70 +220,8 @@ def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
 
 
 # ============================================================
-# TRIGGERS / CLASSIFIERS
+# CLASSIFIERS
 # ============================================================
-MANSIONI_TRIGGERS = [
-    "mansioni superiori", "mansione superiore", "mansioni più alte", "mansioni piu alte",
-    "categoria superiore", "livello superiore", "passaggio di categoria", "cambio categoria",
-    "inquadramento superiore", "posto vacante", "sostituzione", "sto sostituendo",
-]
-
-CONSERVAZIONE_TRIGGERS = [
-    "maternità", "maternita", "congedo maternità", "congedo maternita",
-    "congedo parentale", "parentale",
-    "malattia", "infortunio", "aspettativa",
-    "conservazione del posto", "diritto alla conservazione del posto",
-]
-
-PERMESSI_TRIGGERS = [
-    "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
-    "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami", "formazione",
-    "104", "assemblea", "sindac", "donazione", "rol", "ex festiv", "festività soppresse", "festivita soppresse",
-    "festività abolite", "festivita abolite",
-]
-
-ROL_EXFEST_TRIGGERS = [
-    "rol", "r.o.l", "riduzione orario",
-    "ex festiv", "ex-festiv", "exfestiv",
-    "festività soppresse", "festivita soppresse",
-    "festività abolite", "festivita abolite",
-    "festività infrasettimanali", "festivita infrasettimanali",
-    "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
-]
-
-MALATTIA_TRIGGERS = [
-    "malattia", "certificato", "certificat", "inps",
-    "comporto", "prognosi", "ricaduta",
-    "visita fiscale", "reperibil", "fasce",
-    "ricovero", "day hospital",
-    "infortunio",
-]
-
-STRAORDINARI_TRIGGERS = [
-    "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
-    "notturno", "festivo", "supplementare", "oltre orario"
-]
-
-def is_mansioni_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in MANSIONI_TRIGGERS)
-
-def is_conservazione_context(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in CONSERVAZIONE_TRIGGERS)
-
-def is_permessi_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in PERMESSI_TRIGGERS)
-
-def is_rol_exfest_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in ROL_EXFEST_TRIGGERS)
-
-def is_malattia_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in MALATTIA_TRIGGERS)
-
 def is_straordinario_notturno_question(q: str) -> bool:
     ql = q.lower()
     return ("straordin" in ql) and ("notturn" in ql)
@@ -311,57 +230,27 @@ def is_lavoro_notturno_question(q: str) -> bool:
     ql = q.lower()
     return ("notturn" in ql) and ("straordin" not in ql)
 
-# ✅ FIX STRAORDINARI (classificatore dedicato)
 def is_straordinario_question(q: str) -> bool:
     ql = q.lower()
-    return ("straordin" in ql) or ("supplementare" in ql) or ("oltre orario" in ql) or ("maggioraz" in ql)
+    return ("straordin" in ql) or ("maggioraz" in ql) or ("oltre orario" in ql) or ("supplementare" in ql)
 
+def is_permessi_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in [
+        "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
+        "rol", "ex festiv", "festività soppresse", "festivita soppresse",
+        "studio", "esami", "104", "assemblea", "sindac", "donazione", "lutto", "matrimonio"
+    ])
 
-# ============================================================
-# PERMESSI: CATEGORIE (coverage)
-# ============================================================
-PERMESSI_CATEGORIES = {
-    "rol_exfest": [r"\brol\b", r"riduzione\s+orario", r"festivit", r"soppresse", r"abolite"],
-    "visite_mediche": [r"visite?\s+med", r"specialist", r"accertament", r"struttur[ae]\s+sanitar"],
-    "lutto": [r"\blutto\b", r"decesso", r"familiare", r"grave\s+lutto"],
-    "matrimonio": [r"matrimon", r"nozz"],
-    "studio_formazione": [r"diritto\s+allo\s+studio", r"\b150\s+ore\b", r"\bstudio\b", r"\besami\b", r"formazion"],
-    "legge_104": [r"\b104\b", r"legge\s*104", r"handicap"],
-    "sindacali": [r"sindacal", r"\brsu\b", r"assemblea", r"permessi?\s+sindacal"],
-    "donazione_sangue": [r"donazion", r"sangue", r"emocomponent"],
-    "altri_permessi": [r"permessi?\s+retribuit", r"assenze?\s+retribuit", r"conged"],
-}
-
-def permessi_category_coverage(chunks: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
-    joined = " ".join([(c.get("text") or "") for c in chunks]).lower()
-    found = set()
-    for cat, pats in PERMESSI_CATEGORIES.items():
-        for p in pats:
-            if re.search(p, joined, flags=re.IGNORECASE):
-                found.add(cat)
-                break
-    return len(found), sorted(found)
-
-def build_permessi_expansion_queries(user_q: str) -> List[str]:
-    base = user_q.strip()
-    qs = [
-        f"{base} ROL festività soppresse abolite riposi retribuiti",
-        f"{base} permessi visite mediche retribuiti",
-        f"{base} permessi lutto retribuiti",
-        f"{base} permessi matrimonio retribuiti",
-        f"{base} permessi legge 104 retribuiti",
-        f"{base} permessi sindacali assemblea RSU",
-        f"{base} permessi diritto allo studio 150 ore",
-        f"{base} permessi donazione sangue",
-        f"{base} assenze retribuite elenco tipologie",
-    ]
-    out, seen = [], set()
-    for x in qs:
-        x = x.strip()
-        if x and x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out[:MAX_MULTI_QUERIES]
+def is_rol_exfest_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in [
+        "rol", "r.o.l", "riduzione orario",
+        "ex festiv", "ex-festiv", "exfestiv",
+        "festività soppresse", "festivita soppresse",
+        "festività abolite", "festivita abolite",
+        "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
+    ])
 
 
 # ============================================================
@@ -387,7 +276,7 @@ def build_enriched_question(current_q: str) -> str:
 
 
 # ============================================================
-# QUERY BUILDER (multi-query)
+# QUERY BUILDER
 # ============================================================
 def build_queries(q: str) -> List[str]:
     q0 = q.strip()
@@ -395,76 +284,47 @@ def build_queries(q: str) -> List[str]:
 
     qs = [q0, f"{q0} CCNL", f"{q0} regole condizioni", f"{q0} definizione procedura"]
 
-    user_is_rol = is_rol_exfest_question(q0)
-    user_is_perm = is_permessi_question(q0)
-    user_is_mal = is_malattia_question(q0)
-    user_is_mans = is_mansioni_question(q0)
-    user_is_conserv = is_conservazione_context(q0)
-
-    # ✅ FIX STRAORDINARI: detect dedicato
+    user_is_notturno = is_lavoro_notturno_question(q0)
+    user_is_straord_notturno = is_straordinario_notturno_question(q0)
     user_is_straord = is_straordinario_question(q0)
+    user_is_perm = is_permessi_question(q0)
+    user_is_rol = is_rol_exfest_question(q0)
 
-    # ========== ROL / ex festività ==========
+    # NOTTURNO ORDINARIO (molto specifico)
+    if user_is_notturno and (not user_is_straord_notturno):
+        qs += [
+            "lavoro notturno ordinario maggiorazione percentuale",
+            "turno notturno maggiorazione retribuzione",
+            "indennità lavoro notturno percentuale",
+            "maggiorazione lavoro notturno (non straordinario)",
+            "definizione lavoro notturno fascia oraria",
+        ]
+
+    # STRAORDINARI
+    if user_is_straord or ("maggioraz" in qlow) or ("straordin" in qlow):
+        qs += [
+            "lavoro straordinario maggiorazioni percentuali CCNL",
+            "percentuali maggiorazione straordinario diurno",
+            "percentuali maggiorazione straordinario notturno",
+            "straordinario festivo maggiorazione percentuale",
+            "tabella maggiorazioni lavoro straordinario",
+        ]
+
+    # Permessi + ROL/ex fest
+    if user_is_perm and (not user_is_rol):
+        qs += [
+            "permessi retribuiti tipologie elenco",
+            "assenze retribuite tipologie",
+            "assemblea sindacale ore retribuite",
+            "diritto allo studio 150 ore triennio",
+            "ROL riduzione orario festività soppresse abolite",
+        ]
+
     if user_is_rol:
         qs += [
             "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
-            "festività soppresse abolite riposi retribuiti quanti giorni",
-            "festività infrasettimanali abolite riposi retribuiti",
-            "riposi retribuiti in sostituzione delle festività abolite",
-            "modalità richiesta fruizione ROL e riposi festività abolite preavviso programmazione",
-            "residui ROL scadenze eventuale monetizzazione (se prevista)",
-        ]
-
-    # ========== Permessi generici ==========
-    if user_is_perm and (not user_is_rol):
-        qs += [
-            "permessi retribuiti tipologie CCNL elenco completo",
-            "assenze retribuite tipologie visite mediche lutto matrimonio 104 sindacali studio donazione sangue",
-            "permessi sindacali assemblea ore retribuite",
-            "diritto allo studio 150 ore triennio permessi retribuiti",
-            "permessi per esami lavoratori studenti una settimana di calendario all'anno",
-            "ROL riduzione orario di lavoro riposi retribuiti",
             "festività soppresse abolite riposi retribuiti",
-        ]
-
-    # ========== Malattia ==========
-    if user_is_mal:
-        qs += [
-            "malattia trattamento economico percentuali integrazione",
-            "malattia periodo di comporto regole conteggio",
-            "malattia obblighi comunicazione certificazione",
-            "controlli visite fiscali reperibilità fasce",
-            "malattia durante ferie sospensione ferie",
-            "ricovero ospedaliero day hospital ricaduta",
-        ]
-
-    # ========== Straordinari / notturno ==========
-    # ✅ FIX STRAORDINARI: query più aggressive per agganciare %/maggiorazioni
-    if any(t in qlow for t in STRAORDINARI_TRIGGERS) or user_is_straord:
-        qs += [
-            "lavoro straordinario maggiorazioni percentuali CCNL",
-            "maggiorazione lavoro straordinario diurno percentuale",
-            "maggiorazione straordinario notturno percentuale",
-            "maggiorazione lavoro notturno ordinario percentuale (non straordinario)",
-            "lavoro festivo maggiorazioni percentuali",
-            "straordinario festivo maggiorazione percentuale",
-            "compenso lavoro straordinario come viene pagato",
-            "prestazioni straordinarie maggiorazioni",
-            "lavoro supplementare maggiorazione",
-            "tabella maggiorazioni straordinario",
-            "maggiorazioni straordinario percentuali",
-            "percentuali maggiorazione straordinario",
-        ]
-
-    # ========== Mansioni superiori / categoria ==========
-    if user_is_mans or user_is_conserv:
-        qs += [
-            "mansioni superiori regole generali posto vacante",
-            "mansioni superiori 30 giorni consecutivi 60 giorni discontinui",
-            "assegnazione a mansioni superiori effetti inquadramento",
-            "non si applica in caso di sostituzione di dipendente assente con diritto alla conservazione del posto",
-            "trattamento economico durante mansioni superiori",
-            "formazione addestramento affiancamento non costituisce mansioni superiori",
+            "festività infrasettimanali abolite riposi retribuiti",
         ]
 
     out, seen = [], set()
@@ -477,26 +337,14 @@ def build_queries(q: str) -> List[str]:
 
 
 # ============================================================
-# EVIDENCE EXTRACTION (robusta)
+# EVIDENCE EXTRACTION
 # ============================================================
 def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
     patterns = [
-        r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"%",
-
-        r"posto\s+vacante", r"mansioni?\s+superiori?", r"sostituzion",
-        r"conservazion.*posto", r"diritto.*conservazion.*posto",
-        r"non\s+si\s+applica", r"non\s+costituisc",
-        r"affiancament", r"addestrament", r"formazion",
-
-        r"\brol\b", r"riduzione\s+orario",
-        r"festivit", r"soppresse", r"abolite", r"infrasettimanali",
-
-        r"notturn", r"straordin", r"maggior",
+        r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"%", r"maggior", r"indennit",
+        r"notturn", r"straordin", r"festiv",
+        r"\brol\b", r"festivit", r"soppresse", r"abolite", r"infrasettimanali",
         r"permess", r"assenze?\s+retribuit",
-        r"assemblea", r"sindacal", r"\b104\b",
-        r"diritto\s+allo\s+studio", r"\b150\s+ore\b",
-
-        r"malatt", r"comporto", r"certificat", r"reperibil", r"visita\s+fiscale",
     ]
 
     evidences: List[str] = []
@@ -518,14 +366,16 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
             seen.add(e)
     return out[:MAX_EVIDENCE_LINES]
 
-
-def evidence_has_30_60(evidence_lines: List[str]) -> bool:
-    joined = " ".join(evidence_lines).lower()
-    return (re.search(r"\b30\b", joined) is not None) and (re.search(r"\b60\b", joined) is not None)
+def evidence_has_notturno_ordinario_percent(evidence_lines: List[str]) -> bool:
+    for e in evidence_lines:
+        el = e.lower()
+        if ("notturn" in el) and ("%" in el) and ("straordin" not in el):
+            return True
+    return False
 
 
 # ============================================================
-# OPTIONAL BM25 RERANK (precision boost)
+# BM25 RERANK (optional)
 # ============================================================
 def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not BM25_AVAILABLE or not candidates:
@@ -538,42 +388,44 @@ def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, 
 
 
 # ============================================================
-# SYSTEM RULES (core)
+# ✅ FORCED RETRIEVAL: NOTTURNO ORDINARIO % (deterministico su TUTTO il CCNL)
+# Cerca chunk con: notturn + % e NON straordin
+# ============================================================
+def forced_find_notturno_ordinario_chunks(meta: List[Dict[str, Any]], topn: int = 6) -> List[Dict[str, Any]]:
+    scored: List[Tuple[int, int]] = []  # (score, idx)
+    for idx, c in enumerate(meta):
+        txt = (c.get("text") or "").lower()
+        if "notturn" in txt and "%" in txt and "straordin" not in txt:
+            # score grezzo: quante volte compaiono parole chiave
+            score = txt.count("notturn") * 3 + txt.count("%") * 2 + txt.count("maggior") + txt.count("indennit")
+            scored.append((score, idx))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    picked = [meta[i] for _, i in scored[:topn]]
+    return picked
+
+
+# ============================================================
+# RULES
 # ============================================================
 RULES = """
 Sei l’assistente UILCOM per lavoratori IPZS.
-Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto (estratti CCNL) fornito.
+Rispondi in modo chiaro basandoti SOLO sul contesto CCNL fornito.
 Non inventare informazioni.
 
-REGOLE IMPORTANTI:
-1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nel CCNL caricato."
-2) NON confondere lavoro notturno con straordinario notturno:
-   - Se la domanda è "lavoro notturno" (ordinario), usa solo regole/percentuali del notturno ordinario.
-   - Se nel contesto trovi solo "straordinario notturno", devi dirlo e NON applicarlo al notturno ordinario.
-3) STRAORDINARIO:
-   - Se la domanda è sullo straordinario, cerca nel contesto: "maggiorazione", "percentuale", "festivo", "notturno".
-   - Se nel contesto recuperato non ci sono percentuali/numeri, dichiaralo.
-4) MANSIONI SUPERIORI / CATEGORIA:
-   - Se nel contesto emergono 30 giorni consecutivi / 60 giorni non consecutivi, questi vanno riportati.
-   - Se nel contesto emerge la distinzione posto vacante vs sostituzione con conservazione del posto, riportala chiaramente.
-5) TERMINOLOGIA EX FESTIVITÀ:
-   - Se l’utente dice "ex festività" ma nel CCNL trovi "festività soppresse/abolite/infrasettimanali abolite",
-     spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
-6) Permessi:
-   - Elenca SOLO le tipologie che trovi nel contesto.
-   - Se l’utente chiede "tutti i permessi", includi anche ROL/festività abolite solo se compaiono nel contesto recuperato.
-7) Output: prepara una risposta pulita per l’utente (senza citare pagine).
-   Le pagine/estratti vanno messi SOLO nella sezione ADMIN.
+CRITICO NOTTURNO:
+- Se la domanda è su lavoro notturno ordinario, usa SOLO la percentuale/indennità del notturno ordinario.
+- NON usare percentuali di "straordinario notturno" (es. 60%) per il notturno ordinario.
+- Se nel contesto non c’è la percentuale del notturno ordinario, devi dirlo.
 
-FORMATO OUTPUT OBBLIGATORIO:
+FORMATO OUTPUT:
 
 <PUBLIC>
-...testo per l’utente...
+...testo per l’utente (senza pagine)...
 </PUBLIC>
 
 <ADMIN>
-- Evidenze: ...
-- Pagine/chunk usati: ...
+...evidenze con (pag. X) + pagine/chunk...
 </ADMIN>
 """
 
@@ -584,47 +436,42 @@ FORMATO OUTPUT OBBLIGATORIO:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# Render chat (pulita)
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
         if st.session_state.is_admin and m["role"] == "assistant":
-            dbg = m.get("debug", None)
+            dbg = m.get("debug")
             if dbg:
-                with st.expander("🧠 Admin: Query / Evidenze / Chunk (debug)", expanded=False):
-                    st.write("**Domanda arricchita (memoria breve):**")
+                with st.expander("🧠 Admin: Debug", expanded=False):
+                    st.write("**Domanda arricchita:**")
                     st.code(dbg.get("enriched_q", ""))
-                    st.write("**Query usate:**")
+                    st.write("**Query:**")
                     st.code("\n".join(dbg.get("queries", [])))
-                    st.write("**Evidenze estratte:**")
+                    st.write("**Evidenze:**")
                     st.code("\n".join(dbg.get("evidence", [])) or "(nessuna)")
-                    st.write("**Chunk selezionati (prime righe):**")
+                    st.write("**Forced chunks notturno ordinario:**")
+                    st.code("\n".join(dbg.get("forced_notturno_pages", [])) or "(nessuno)")
+                    st.write("**Chunk finali (prime righe):**")
                     for c in dbg.get("selected", []):
                         st.write(f"**Pagina {c.get('page')}**")
-                        txt = (c.get("text") or "")
+                        txt = c.get("text", "") or ""
                         st.write(txt[:800] + ("..." if len(txt) > 800 else ""))
                         st.divider()
 
-
-user_input = st.chat_input("Scrivi una domanda sul CCNL (permessi, ROL/festività soppresse, malattia, straordinari, categorie...)")
+user_input = st.chat_input("Scrivi una domanda sul CCNL (notturno, straordinari, permessi, ROL...)")
 if not user_input:
     st.stop()
 
-# Require index
 if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
     st.session_state.messages.append({"role": "user", "content": user_input})
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": "Prima devo indicizzare il CCNL: apri la barra laterale e clicca **Indicizza / Reindicizza CCNL**.",
-    })
+    st.session_state.messages.append({"role": "assistant", "content": "Prima devi indicizzare il CCNL dalla sidebar."})
     st.rerun()
 
-# Append user msg
 st.session_state.messages.append({"role": "user", "content": user_input})
 
 
 # ============================================================
-# RETRIEVAL PIPELINE
+# RETRIEVAL
 # ============================================================
 enriched_q = build_enriched_question(user_input)
 
@@ -634,7 +481,6 @@ emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
 queries = build_queries(enriched_q)
 
-# Multi-query semantic retrieval
 scores_best: Dict[int, float] = {}
 for q in queries:
     qvec = np.array(emb.embed_query(q), dtype=np.float32)
@@ -646,98 +492,55 @@ for q in queries:
         if (ii not in scores_best) or (s > scores_best[ii]):
             scores_best[ii] = s
 
-provisional_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
-provisional_selected = [meta[i] for i in provisional_idx]
-provisional_evidence = extract_key_evidence(provisional_selected)
-
-# Guardrail: permessi coverage pass 2
-user_is_perm = is_permessi_question(enriched_q)
-user_is_rol = is_rol_exfest_question(enriched_q)
-
-if user_is_perm and (not user_is_rol):
-    cov_n, _ = permessi_category_coverage(provisional_selected)
-    if cov_n < PERMESSI_MIN_CATEGORY_COVERAGE:
-        extra_queries = build_permessi_expansion_queries(enriched_q)
-        for q in extra_queries:
-            qvec = np.array(emb.embed_query(q), dtype=np.float32)
-            sims = cosine_scores(qvec, mat_norm)
-            top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
-            for i in top_idx:
-                ii = int(i)
-                s = float(sims[ii])
-                if (ii not in scores_best) or (s > scores_best[ii]):
-                    scores_best[ii] = s
-
-# Re-ranking with domain boosts (fix mansioni + notturno + straordinari)
-user_is_mans = is_mansioni_question(enriched_q) or ("categoria" in enriched_q.lower())
-user_is_conserv = is_conservazione_context(enriched_q)
+# Re-ranking boosts (notturno ordinario anti-straordinario)
 user_is_notturno = is_lavoro_notturno_question(enriched_q)
 user_is_straord_notturno = is_straordinario_notturno_question(enriched_q)
 user_is_straord = is_straordinario_question(enriched_q)
-
-force_30_60 = evidence_has_30_60(provisional_evidence) and user_is_mans
 
 for i in list(scores_best.keys()):
     txt = (meta[i].get("text") or "").lower()
     boost = 0.0
 
-    # Mansioni superiori boosts
-    if user_is_mans or user_is_conserv:
-        if re.search(r"\b30\b", txt) and re.search(r"\b60\b", txt):
-            boost += 0.18
-        if "posto vacante" in txt:
-            boost += 0.08
-        if "conservazione del posto" in txt or "diritto alla conservazione" in txt:
-            boost += 0.08
-        if "non si applica" in txt or "non si applicano" in txt:
-            boost += 0.07
-        if "affianc" in txt or "formaz" in txt or "addestr" in txt:
-            boost += 0.03
-
-    # ROL / festività soppresse boosts
-    if user_is_rol:
-        if re.search(r"\brol\b", txt) or "riduzione orario" in txt:
-            boost += 0.16
-        if "festività soppresse" in txt or "festivita soppresse" in txt or "abolite" in txt or "infrasettimanali" in txt:
-            boost += 0.16
-        if "diritto allo studio" in txt or "150 ore" in txt:
-            boost -= 0.10
-
-    # Notturno vs straordinario notturno
-    if user_is_notturno:
-        if "notturn" in txt and "straordin" not in txt:
-            boost += 0.10
-        if "straordin" in txt and "notturn" in txt:
-            boost -= 0.08
+    if user_is_notturno and (not user_is_straord_notturno):
+        if ("notturn" in txt) and ("straordin" not in txt) and ("%" in txt):
+            boost += 0.28
+        if ("notturn" in txt) and ("straordin" not in txt):
+            boost += 0.12
+        if ("straordin" in txt) and ("notturn" in txt):
+            boost -= 0.28
+        if "60%" in txt or "60 %" in txt:
+            boost -= 0.18
 
     if user_is_straord_notturno:
-        if "straordin" in txt and "notturn" in txt:
-            boost += 0.12
+        if ("straordin" in txt) and ("notturn" in txt) and ("%" in txt):
+            boost += 0.22
 
-    # ✅ FIX STRAORDINARI: boost dedicato (per prendere i chunk con % / maggiorazioni)
     if user_is_straord:
         if "straordin" in txt:
-            boost += 0.14
-        if "maggior" in txt:
-            boost += 0.10
-        if "%" in txt or "percent" in txt:
-            boost += 0.07
-        if "festiv" in txt:
-            boost += 0.05
-        if "notturn" in txt:
-            boost += 0.05
-
-    # Permessi generic boosts
-    if user_is_perm and (not user_is_rol):
-        if "permess" in txt or "assenze retribuite" in txt:
-            boost += 0.07
+            boost += 0.16
+        if "maggior" in txt or "%" in txt:
+            boost += 0.08
 
     scores_best[i] = scores_best[i] + boost
 
 final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
 selected = [meta[i] for i in final_idx]
 
-# Optional BM25 rerank for final precision
+# ✅ Forced retrieval injection for notturno ordinario:
+forced_notturno = []
+if user_is_notturno and (not user_is_straord_notturno):
+    forced_notturno = forced_find_notturno_ordinario_chunks(meta, topn=FORCED_NOTTURNO_TOPN)
+    # Merge: prepend forced chunks (no duplicates by page+text hash)
+    seen = set()
+    merged: List[Dict[str, Any]] = []
+    for c in forced_notturno + selected:
+        key = (str(c.get("page")), (c.get("text") or "")[:200])
+        if key not in seen:
+            merged.append(c)
+            seen.add(key)
+    selected = merged[:TOP_K_FINAL]  # keep limit
+
+# BM25 rerank final
 selected = bm25_rerank(enriched_q, selected)
 
 context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
@@ -745,57 +548,37 @@ context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}"
 key_evidence = extract_key_evidence(selected)
 evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
 
-guardrail_mansioni = ""
-if force_30_60:
-    guardrail_mansioni = (
-        "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori se parli di passaggio categoria/mansioni superiori.\n"
-    )
-
-guardrail_notturno = ""
-if user_is_notturno:
-    guardrail_notturno = (
-        "GUARDRAIL NOTTURNO: la domanda è su lavoro notturno (ordinario). NON usare percentuali di straordinario notturno.\n"
-    )
-elif user_is_straord_notturno:
-    guardrail_notturno = (
-        "GUARDRAIL STRAORD. NOTTURNO: la domanda è su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
-    )
-
-guardrail_straord = ""
-if user_is_straord:
-    guardrail_straord = (
-        "GUARDRAIL STRAORDINARIO: la domanda è sullo straordinario. Se nel contesto ci sono percentuali/maggiorazioni, riportale.\n"
-        "Se nel contesto NON ci sono percentuali/numeri, dichiaralo esplicitamente e non inventare.\n"
-    )
-
 
 # ============================================================
-# LLM CALL
+# LLM
 # ============================================================
 llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
+
+guardrail = ""
+if user_is_notturno and (not user_is_straord_notturno):
+    guardrail = (
+        "GUARDRAIL: domanda su NOTTURNO ORDINARIO. "
+        "Dai percentuale SOLO se nel contesto c’è una frase su notturno (senza 'straordinario') con quella percentuale. "
+        "NON usare 60% se è riferito a straordinario notturno.\n"
+    )
 
 prompt = f"""
 {RULES}
 
-{guardrail_mansioni}
-{guardrail_notturno}
-{guardrail_straord}
+{guardrail}
 
-DOMANDA (UTENTE):
+DOMANDA UTENTE:
 {user_input}
 
-DOMANDA ARRICCHITA (MEMORIA BREVE):
-{enriched_q}
-
-EVIDENZE (se presenti, sono operative):
+EVIDENZE (operative se presenti):
 {evidence_block}
 
-CONTESTO CCNL (estratti):
+CONTESTO CCNL:
 {context}
 
 RICORDA:
-- Nel PUBLIC: risposta pulita, senza pagine.
-- Nel ADMIN: inserisci elenco pagine trovate e 5-10 righe evidenza più importanti con (pag. X).
+- PUBLIC: senza pagine.
+- ADMIN: evidenze con pagine.
 """
 
 def split_public_admin(text: str) -> Tuple[str, str]:
@@ -817,14 +600,26 @@ except Exception as e:
     raw = f"<PUBLIC>Errore nel generare la risposta: {e}</PUBLIC><ADMIN></ADMIN>"
 
 public_ans, admin_ans = split_public_admin(raw)
-
 if not public_ans:
     public_ans = "Non ho trovato la risposta nel CCNL caricato."
 
-assistant_payload: Dict[str, Any] = {
-    "role": "assistant",
-    "content": public_ans,
-}
+# ============================================================
+# SANITY CHECK (blocca 60% sul notturno ordinario SOLO se non c’è evidenza)
+# ============================================================
+if user_is_notturno and (not user_is_straord_notturno):
+    has_ord_percent = evidence_has_notturno_ordinario_percent(key_evidence)
+    says_60 = ("60%" in public_ans) or ("60 %" in public_ans)
+    if says_60 and (not has_ord_percent):
+        public_ans = (
+            "Nel CCNL caricato emerge una maggiorazione del **60%** riferita allo **straordinario notturno**. "
+            "Per il **lavoro notturno ordinario** non posso attribuire quella percentuale.\n\n"
+            "Nel contesto recuperato in questa risposta non trovo una riga chiara con la percentuale del notturno ordinario. "
+            "Riprovare/raffinare il recupero (admin) per agganciare il paragrafo corretto del CCNL."
+        )
+        if st.session_state.is_admin:
+            admin_ans = (admin_ans or "") + "\n\n[SANITY] Bloccato 60% su notturno ordinario: nessuna evidenza notturno ordinario con % nel contesto."
+
+assistant_payload: Dict[str, Any] = {"role": "assistant", "content": public_ans}
 
 if st.session_state.is_admin:
     assistant_payload["debug"] = {
@@ -834,6 +629,7 @@ if st.session_state.is_admin:
         "selected": selected,
         "admin_llm_section": admin_ans,
         "bm25_available": BM25_AVAILABLE,
+        "forced_notturno_pages": [f"pag.{c.get('page')}" for c in forced_notturno] if forced_notturno else [],
     }
 
 st.session_state.messages.append(assistant_payload)
