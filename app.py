@@ -1,11 +1,11 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (versione stabile + ferie fix)
+# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva + FIX STRAORDINARI)
 # ✅ Risposte SOLO dal CCNL
 # ✅ Utenti: risposta pulita (senza fonti)
 # ✅ Admin: debug + evidenze + chunk/pagine usate
 # ✅ Fix: ex festività = festività soppresse/abolite/infrasettimanali abolite
 # ✅ Fix: mansioni superiori (30/60 + posto vacante + esclusione conservazione posto)
 # ✅ Fix: lavoro notturno vs straordinario notturno (non confondere %)
-# ✅ FIX NUOVO: FERIE (27 giorni lavorativi se presente nel contesto)
+# ✅ FIX STRAORDINARI: query + boost + precisione maggiorazioni
 # ✅ Indice vettoriale persistente (vectors.npy + chunks.json)
 
 import os
@@ -47,9 +47,14 @@ TOP_K_FINAL = 18
 MAX_MULTI_QUERIES = 12
 
 MEMORY_USER_TURNS = 3
+
+# Permessi: quante categorie diverse provare a coprire
 PERMESSI_MIN_CATEGORY_COVERAGE = 3
+
+# Admin debug: quante righe evidenza mostrare
 MAX_EVIDENCE_LINES = 18
 
+# LLM
 LLM_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0
 
@@ -65,8 +70,10 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
         pass
     return os.getenv(key, default)
 
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
 
 UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin debug
@@ -118,6 +125,7 @@ if "is_admin" not in st.session_state:
 with st.sidebar:
     st.header("⚙️ Controlli")
 
+    # Admin login
     st.subheader("🧠 Admin (debug)")
     if ADMIN_PASSWORD:
         admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
@@ -138,6 +146,7 @@ with st.sidebar:
 
     st.divider()
 
+    # Index management
     st.subheader("📦 Indice CCNL")
     ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
     st.write("Indice presente:", "✅" if ok_index else "❌")
@@ -153,23 +162,30 @@ with st.sidebar:
                 loader = PyPDFLoader(PDF_PATH)
                 docs = loader.load()
 
-                splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+                )
                 chunks = splitter.split_documents(docs)
 
                 texts = [c.page_content for c in chunks]
-                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine PDF 1-based
+                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based (foglio PDF)
 
                 if not OPENAI_API_KEY:
                     raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
 
                 emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors = np.array(emb.embed_documents(texts), dtype=np.float32)
+                vectors = emb.embed_documents(texts)
+                vectors = np.array(vectors, dtype=np.float32)
 
                 np.save(VEC_PATH, vectors)
                 with open(META_PATH, "w", encoding="utf-8") as f:
-                    json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
+                    json.dump(
+                        [{"page": p, "text": t} for p, t in zip(pages, texts)],
+                        f,
+                        ensure_ascii=False,
+                    )
 
-            st.success(f"Indicizzazione completata. Chunk: {len(texts)}")
+            st.success(f"Indicizzazione completata. Chunk: {len(chunks)}")
             st.rerun()
         except Exception as e:
             st.error(str(e))
@@ -179,7 +195,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption("Dopo modifiche su GitHub: Streamlit Cloud auto-redeploy. Se no: Reboot app.")
+    st.caption("Dopo modifiche a app.py su GitHub, Streamlit Cloud di solito fa auto-redeploy. Se no: **Reboot app**.")
 
 
 # ============================================================
@@ -200,9 +216,11 @@ if not OPENAI_API_KEY:
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
 
+
 def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     return mat_norm @ q
+
 
 def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
     vectors = np.load(VEC_PATH)
@@ -260,16 +278,9 @@ MALATTIA_TRIGGERS = [
     "infortunio",
 ]
 
-# ✅ NUOVO: FERIE triggers
-FERIE_TRIGGERS = [
-    "ferie", "quante ferie", "giorni di ferie", "periodo di ferie",
-    "ferie annuali", "ferie annue", "maturazione ferie", "residuo ferie",
-    "malattia durante ferie", "richiesta ferie", "piano ferie", "programmazione ferie",
-]
-
 STRAORDINARI_TRIGGERS = [
     "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
-    "notturno", "festivo", "supplementare"
+    "notturno", "festivo", "supplementare", "oltre orario"
 ]
 
 def is_mansioni_question(q: str) -> bool:
@@ -292,10 +303,6 @@ def is_malattia_question(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in MALATTIA_TRIGGERS)
 
-def is_ferie_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in FERIE_TRIGGERS)
-
 def is_straordinario_notturno_question(q: str) -> bool:
     ql = q.lower()
     return ("straordin" in ql) and ("notturn" in ql)
@@ -303,6 +310,11 @@ def is_straordinario_notturno_question(q: str) -> bool:
 def is_lavoro_notturno_question(q: str) -> bool:
     ql = q.lower()
     return ("notturn" in ql) and ("straordin" not in ql)
+
+# ✅ FIX STRAORDINARI (classificatore dedicato)
+def is_straordinario_question(q: str) -> bool:
+    ql = q.lower()
+    return ("straordin" in ql) or ("supplementare" in ql) or ("oltre orario" in ql) or ("maggioraz" in ql)
 
 
 # ============================================================
@@ -388,9 +400,11 @@ def build_queries(q: str) -> List[str]:
     user_is_mal = is_malattia_question(q0)
     user_is_mans = is_mansioni_question(q0)
     user_is_conserv = is_conservazione_context(q0)
-    user_is_ferie = is_ferie_question(q0)
 
-    # ROL / ex festività
+    # ✅ FIX STRAORDINARI: detect dedicato
+    user_is_straord = is_straordinario_question(q0)
+
+    # ========== ROL / ex festività ==========
     if user_is_rol:
         qs += [
             "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
@@ -401,7 +415,7 @@ def build_queries(q: str) -> List[str]:
             "residui ROL scadenze eventuale monetizzazione (se prevista)",
         ]
 
-    # Permessi generici
+    # ========== Permessi generici ==========
     if user_is_perm and (not user_is_rol):
         qs += [
             "permessi retribuiti tipologie CCNL elenco completo",
@@ -413,7 +427,7 @@ def build_queries(q: str) -> List[str]:
             "festività soppresse abolite riposi retribuiti",
         ]
 
-    # Malattia
+    # ========== Malattia ==========
     if user_is_mal:
         qs += [
             "malattia trattamento economico percentuali integrazione",
@@ -424,28 +438,25 @@ def build_queries(q: str) -> List[str]:
             "ricovero ospedaliero day hospital ricaduta",
         ]
 
-    # ✅ FERIE (NUOVO)
-    if user_is_ferie:
+    # ========== Straordinari / notturno ==========
+    # ✅ FIX STRAORDINARI: query più aggressive per agganciare %/maggiorazioni
+    if any(t in qlow for t in STRAORDINARI_TRIGGERS) or user_is_straord:
         qs += [
-            "ferie periodo di ferie quanti giorni lavorativi",
-            "ferie 27 giorni lavorativi grafici editoriali",
-            "ferie maturazione fruizione frazionamento",
-            "ferie distribuzione orario settimanale 5 giorni calcolo 1,2",
-            "ferie programmazione richiesta termini",
-            "malattia durante ferie sospensione",
+            "lavoro straordinario maggiorazioni percentuali CCNL",
+            "maggiorazione lavoro straordinario diurno percentuale",
+            "maggiorazione straordinario notturno percentuale",
+            "maggiorazione lavoro notturno ordinario percentuale (non straordinario)",
+            "lavoro festivo maggiorazioni percentuali",
+            "straordinario festivo maggiorazione percentuale",
+            "compenso lavoro straordinario come viene pagato",
+            "prestazioni straordinarie maggiorazioni",
+            "lavoro supplementare maggiorazione",
+            "tabella maggiorazioni straordinario",
+            "maggiorazioni straordinario percentuali",
+            "percentuali maggiorazione straordinario",
         ]
 
-    # Straordinari / notturno
-    if any(t in qlow for t in STRAORDINARI_TRIGGERS):
-        qs += [
-            "lavoro straordinario maggiorazioni limiti",
-            "straordinario notturno maggiorazione percentuale",
-            "lavoro notturno maggiorazione percentuale",
-            "notturno ordinario trattamento economico",
-            "lavoro festivo maggiorazioni",
-        ]
-
-    # Mansioni superiori / categoria
+    # ========== Mansioni superiori / categoria ==========
     if user_is_mans or user_is_conserv:
         qs += [
             "mansioni superiori regole generali posto vacante",
@@ -470,25 +481,28 @@ def build_queries(q: str) -> List[str]:
 # ============================================================
 def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
     patterns = [
-        r"\b30\b", r"\b60\b", r"\b27\b", r"\b\d{1,3}\b", r"%",
-        r"ferie", r"giorni\s+lavorativi", r"frazionat", r"1,2",
+        r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"%",
+
         r"posto\s+vacante", r"mansioni?\s+superiori?", r"sostituzion",
         r"conservazion.*posto", r"diritto.*conservazion.*posto",
         r"non\s+si\s+applica", r"non\s+costituisc",
         r"affiancament", r"addestrament", r"formazion",
+
         r"\brol\b", r"riduzione\s+orario",
         r"festivit", r"soppresse", r"abolite", r"infrasettimanali",
+
         r"notturn", r"straordin", r"maggior",
         r"permess", r"assenze?\s+retribuit",
         r"assemblea", r"sindacal", r"\b104\b",
         r"diritto\s+allo\s+studio", r"\b150\s+ore\b",
+
         r"malatt", r"comporto", r"certificat", r"reperibil", r"visita\s+fiscale",
     ]
 
     evidences: List[str] = []
     for c in chunks:
         page = c.get("page", "?")
-        text = (c.get("text", "") or "")
+        text = c.get("text", "") or ""
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         for ln in lines:
             ln_low = ln.lower()
@@ -503,6 +517,7 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
             out.append(e)
             seen.add(e)
     return out[:MAX_EVIDENCE_LINES]
+
 
 def evidence_has_30_60(evidence_lines: List[str]) -> bool:
     joined = " ".join(evidence_lines).lower()
@@ -532,17 +547,23 @@ Non inventare informazioni.
 
 REGOLE IMPORTANTI:
 1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nel CCNL caricato."
-2) NOTTURNO: non confondere lavoro notturno con straordinario notturno.
-3) MANSIONI SUPERIORI / CATEGORIA:
-   - Se emergono 30 giorni consecutivi / 60 non consecutivi, riportali.
-   - Se emerge distinzione posto vacante vs sostituzione con conservazione del posto, riportala.
-4) EX FESTIVITÀ:
+2) NON confondere lavoro notturno con straordinario notturno:
+   - Se la domanda è "lavoro notturno" (ordinario), usa solo regole/percentuali del notturno ordinario.
+   - Se nel contesto trovi solo "straordinario notturno", devi dirlo e NON applicarlo al notturno ordinario.
+3) STRAORDINARIO:
+   - Se la domanda è sullo straordinario, cerca nel contesto: "maggiorazione", "percentuale", "festivo", "notturno".
+   - Se nel contesto recuperato non ci sono percentuali/numeri, dichiaralo.
+4) MANSIONI SUPERIORI / CATEGORIA:
+   - Se nel contesto emergono 30 giorni consecutivi / 60 giorni non consecutivi, questi vanno riportati.
+   - Se nel contesto emerge la distinzione posto vacante vs sostituzione con conservazione del posto, riportala chiaramente.
+5) TERMINOLOGIA EX FESTIVITÀ:
    - Se l’utente dice "ex festività" ma nel CCNL trovi "festività soppresse/abolite/infrasettimanali abolite",
      spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
-5) FERIE:
-   - Se nel contesto trovi un numero di giorni (es. 27 giorni lavorativi), riportalo chiaramente.
-   - Se non trovi il numero nel contesto recuperato, NON inventare: dillo.
-6) Output: nel PUBLIC risposta pulita (senza pagine). Admin-only debug in ADMIN.
+6) Permessi:
+   - Elenca SOLO le tipologie che trovi nel contesto.
+   - Se l’utente chiede "tutti i permessi", includi anche ROL/festività abolite solo se compaiono nel contesto recuperato.
+7) Output: prepara una risposta pulita per l’utente (senza citare pagine).
+   Le pagine/estratti vanno messi SOLO nella sezione ADMIN.
 
 FORMATO OUTPUT OBBLIGATORIO:
 
@@ -563,6 +584,7 @@ FORMATO OUTPUT OBBLIGATORIO:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+# Render chat (pulita)
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -570,7 +592,7 @@ for m in st.session_state.messages:
             dbg = m.get("debug", None)
             if dbg:
                 with st.expander("🧠 Admin: Query / Evidenze / Chunk (debug)", expanded=False):
-                    st.write("**Domanda arricchita:**")
+                    st.write("**Domanda arricchita (memoria breve):**")
                     st.code(dbg.get("enriched_q", ""))
                     st.write("**Query usate:**")
                     st.code("\n".join(dbg.get("queries", [])))
@@ -584,7 +606,7 @@ for m in st.session_state.messages:
                         st.divider()
 
 
-user_input = st.chat_input("Scrivi una domanda sul CCNL (ferie, permessi, ROL/festività soppresse, malattia, straordinari, categorie...)")
+user_input = st.chat_input("Scrivi una domanda sul CCNL (permessi, ROL/festività soppresse, malattia, straordinari, categorie...)")
 if not user_input:
     st.stop()
 
@@ -597,6 +619,7 @@ if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
     })
     st.rerun()
 
+# Append user msg
 st.session_state.messages.append({"role": "user", "content": user_input})
 
 
@@ -611,6 +634,7 @@ emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
 queries = build_queries(enriched_q)
 
+# Multi-query semantic retrieval
 scores_best: Dict[int, float] = {}
 for q in queries:
     qvec = np.array(emb.embed_query(q), dtype=np.float32)
@@ -626,9 +650,10 @@ provisional_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], rever
 provisional_selected = [meta[i] for i in provisional_idx]
 provisional_evidence = extract_key_evidence(provisional_selected)
 
-# Permessi coverage pass 2
+# Guardrail: permessi coverage pass 2
 user_is_perm = is_permessi_question(enriched_q)
 user_is_rol = is_rol_exfest_question(enriched_q)
+
 if user_is_perm and (not user_is_rol):
     cov_n, _ = permessi_category_coverage(provisional_selected)
     if cov_n < PERMESSI_MIN_CATEGORY_COVERAGE:
@@ -643,12 +668,12 @@ if user_is_perm and (not user_is_rol):
                 if (ii not in scores_best) or (s > scores_best[ii]):
                     scores_best[ii] = s
 
-# Re-ranking boosts
+# Re-ranking with domain boosts (fix mansioni + notturno + straordinari)
 user_is_mans = is_mansioni_question(enriched_q) or ("categoria" in enriched_q.lower())
 user_is_conserv = is_conservazione_context(enriched_q)
 user_is_notturno = is_lavoro_notturno_question(enriched_q)
 user_is_straord_notturno = is_straordinario_notturno_question(enriched_q)
-user_is_ferie = is_ferie_question(enriched_q)
+user_is_straord = is_straordinario_question(enriched_q)
 
 force_30_60 = evidence_has_30_60(provisional_evidence) and user_is_mans
 
@@ -656,7 +681,7 @@ for i in list(scores_best.keys()):
     txt = (meta[i].get("text") or "").lower()
     boost = 0.0
 
-    # Mansioni superiori
+    # Mansioni superiori boosts
     if user_is_mans or user_is_conserv:
         if re.search(r"\b30\b", txt) and re.search(r"\b60\b", txt):
             boost += 0.18
@@ -669,7 +694,7 @@ for i in list(scores_best.keys()):
         if "affianc" in txt or "formaz" in txt or "addestr" in txt:
             boost += 0.03
 
-    # ROL / festività soppresse
+    # ROL / festività soppresse boosts
     if user_is_rol:
         if re.search(r"\brol\b", txt) or "riduzione orario" in txt:
             boost += 0.16
@@ -678,24 +703,29 @@ for i in list(scores_best.keys()):
         if "diritto allo studio" in txt or "150 ore" in txt:
             boost -= 0.10
 
-    # ✅ FERIE boost (NUOVO)
-    if user_is_ferie:
-        if "ferie" in txt:
-            boost += 0.18
-        if ("27" in txt and ("giorni" in txt or "giorni lavorativi" in txt)):
-            boost += 0.22
-        if "frazion" in txt or "1,2" in txt:
-            boost += 0.06
-
     # Notturno vs straordinario notturno
     if user_is_notturno:
         if "notturn" in txt and "straordin" not in txt:
             boost += 0.10
         if "straordin" in txt and "notturn" in txt:
             boost -= 0.08
+
     if user_is_straord_notturno:
         if "straordin" in txt and "notturn" in txt:
             boost += 0.12
+
+    # ✅ FIX STRAORDINARI: boost dedicato (per prendere i chunk con % / maggiorazioni)
+    if user_is_straord:
+        if "straordin" in txt:
+            boost += 0.14
+        if "maggior" in txt:
+            boost += 0.10
+        if "%" in txt or "percent" in txt:
+            boost += 0.07
+        if "festiv" in txt:
+            boost += 0.05
+        if "notturn" in txt:
+            boost += 0.05
 
     # Permessi generic boosts
     if user_is_perm and (not user_is_rol):
@@ -707,7 +737,7 @@ for i in list(scores_best.keys()):
 final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
 selected = [meta[i] for i in final_idx]
 
-# Optional BM25 rerank
+# Optional BM25 rerank for final precision
 selected = bm25_rerank(enriched_q, selected)
 
 context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
@@ -717,17 +747,27 @@ evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence els
 
 guardrail_mansioni = ""
 if force_30_60:
-    guardrail_mansioni = "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori.\n"
+    guardrail_mansioni = (
+        "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori se parli di passaggio categoria/mansioni superiori.\n"
+    )
 
 guardrail_notturno = ""
 if user_is_notturno:
-    guardrail_notturno = "GUARDRAIL NOTTURNO: domanda su lavoro notturno ordinario. NON usare % di straordinario notturno.\n"
+    guardrail_notturno = (
+        "GUARDRAIL NOTTURNO: la domanda è su lavoro notturno (ordinario). NON usare percentuali di straordinario notturno.\n"
+    )
 elif user_is_straord_notturno:
-    guardrail_notturno = "GUARDRAIL STRAORD. NOTTURNO: domanda su straordinario notturno. Usa SOLO le % di straordinario notturno.\n"
+    guardrail_notturno = (
+        "GUARDRAIL STRAORD. NOTTURNO: la domanda è su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
+    )
 
-guardrail_ferie = ""
-if user_is_ferie:
-    guardrail_ferie = "GUARDRAIL FERIE: se nel contesto trovi il numero giorni (es. 27 giorni lavorativi), riportalo. Se non c’è, dillo.\n"
+guardrail_straord = ""
+if user_is_straord:
+    guardrail_straord = (
+        "GUARDRAIL STRAORDINARIO: la domanda è sullo straordinario. Se nel contesto ci sono percentuali/maggiorazioni, riportale.\n"
+        "Se nel contesto NON ci sono percentuali/numeri, dichiaralo esplicitamente e non inventare.\n"
+    )
+
 
 # ============================================================
 # LLM CALL
@@ -739,7 +779,7 @@ prompt = f"""
 
 {guardrail_mansioni}
 {guardrail_notturno}
-{guardrail_ferie}
+{guardrail_straord}
 
 DOMANDA (UTENTE):
 {user_input}
@@ -777,6 +817,7 @@ except Exception as e:
     raw = f"<PUBLIC>Errore nel generare la risposta: {e}</PUBLIC><ADMIN></ADMIN>"
 
 public_ans, admin_ans = split_public_admin(raw)
+
 if not public_ans:
     public_ans = "Non ho trovato la risposta nel CCNL caricato."
 
