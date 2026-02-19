@@ -824,3 +824,24 @@ if st.session_state.is_admin:
 
 st.session_state.messages.append(assistant_payload)
 st.rerun()
+# =========================
+# Footer Copyright
+# =========================
+st.markdown(
+    """
+    <div style="
+        position: fixed;
+        bottom: 8px;
+        left: 0;
+        right: 0;
+        text-align: center;
+        font-size: 11px;
+        color: gray;
+        opacity: 0.6;
+        z-index: 999;
+        pointer-events: none;">
+        Assistente Contrattuale UILCOM IPZS • © Bep's
+    </div>
+    """,
+    unsafe_allow_html=True
+)
