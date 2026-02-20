@@ -282,10 +282,9 @@ MANSIONI_TRIGGERS = [
 ]
 
 CONSERVAZIONE_TRIGGERS = [
-    "maternità", "maternita", "congedo maternità", "congedo maternita",
-    "congedo parentale", "parentale",
-    "malattia", "infortunio", "aspettativa",
-    "conservazione del posto", "diritto alla conservazione del posto",
+    "conservazione del posto",
+    "diritto alla conservazione del posto",
+    "diritto alla conservazione",
 ]
 
 PERMESSI_TRIGGERS = [
@@ -349,16 +348,24 @@ def is_lavoro_notturno_question(q: str) -> bool:
 def detect_topic(q: str) -> str:
     """Topic per evitare che la memoria contamini argomenti diversi."""
     ql = q.lower()
-    if is_mansioni_question(ql) or is_conservazione_context(ql):
-        return "mansioni"
-    if is_rol_exfest_question(ql):
-        return "rol_exfest"
-    if is_permessi_question(ql):
-        return "permessi"
+
+    # PRIORITÀ: domande su malattia devono restare su "malattia"
     if is_malattia_question(ql):
         return "malattia"
+
+    # Mansioni: solo se l’utente parla davvero di mansioni/cambio livello/sostituzione ecc.
+    if is_mansioni_question(ql):
+        return "mansioni"
+
+    if is_rol_exfest_question(ql):
+        return "rol_exfest"
+
+    if is_permessi_question(ql):
+        return "permessi"
+
     if any(t in ql for t in STRAORDINARI_TRIGGERS):
         return "straordinari_notturno_festivo"
+
     return "altro"
 
 
@@ -424,13 +431,15 @@ def build_queries(q: str) -> List[str]:
             "festività soppresse abolite riposi retribuiti",
         ]
 
-    # ========== Malattia ==========
-    if user_is_mal:
-        qs += [
-            "malattia trattamento economico percentuali integrazione",
-            "malattia periodo di comporto regole conteggio",
-            "visite fiscali reperibilità fasce",
-        ]
+   # ========== Malattia ==========
+if user_is_mal:
+    qs += [
+        "malattia trattamento economico percentuali integrazione INPS CCNL",
+        "malattia retribuzione primi giorni carenza integrazione azienda",
+        "malattia periodo di comporto durata conservazione posto",
+        "malattia visite fiscali reperibilità fasce orarie",
+        "malattia ricovero ospedaliero trattamento economico",
+    ]
 
     # ========== Straordinari / notturno ==========
     if any(t in qlow for t in STRAORDINARI_TRIGGERS):
@@ -657,6 +666,12 @@ REGOLE IMPORTANTI:
 4) Permessi:
    - Elenca SOLO le tipologie che trovi nel contesto.
 5) PUBBLICO: devi SEMPRE includere una riga finale "Fonte: CCNL (pag. X...)" con le pagine usate.
+6) MALATTIA:
+   - Se la domanda riguarda la malattia, includi se presenti nel contesto:
+     • trattamento economico (percentuali o integrazione)
+     • periodo di comporto
+     • eventuali regole di reperibilità/visite fiscali
+   - Se alcune informazioni non sono nel contesto recuperato, non inventarle.
 
 FORMATO OUTPUT OBBLIGATORIO:
 
@@ -909,3 +924,4 @@ if st.session_state.is_admin:
 st.session_state.last_topic = topic
 st.session_state.messages.append(assistant_payload)
 st.rerun()
+
