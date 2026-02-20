@@ -1,21 +1,18 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva + LOGS + admin dashboard)
+# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva)
 # ✅ Risposte SOLO dal CCNL
 # ✅ Utenti: risposta pulita (senza fonti)
-# ✅ Admin: debug + evidenze + chunk/pagine usate + LOG viewer
+# ✅ Admin: debug + evidenze + chunk/pagine usate
 # ✅ Fix: ex festività = festività soppresse/abolite/infrasettimanali abolite
 # ✅ Fix: mansioni superiori (30/60 + posto vacante + esclusione conservazione posto)
 # ✅ Fix: lavoro notturno vs straordinario notturno (non confondere %)
+# ✅ Guardrail HARD: mansioni superiori -> risposta deterministica (no "3 mesi")
 # ✅ Indice vettoriale persistente (vectors.npy + chunks.json)
-# ✅ Logging automatico Q/A in dataset/logs.jsonl
-# ✅ (Opzionale) Push logs su GitHub con token in Secrets
 
 import os
 import json
 import re
 import time
 import hashlib
-import base64
-from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -62,41 +59,28 @@ MAX_EVIDENCE_LINES = 18
 LLM_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0
 
-# Dataset / Logs
-DATASET_DIR = "dataset"
-LOG_PATH = os.path.join(DATASET_DIR, "logs.jsonl")
-DATASET_UILCOM_PATH = os.path.join(DATASET_DIR, "dataset_uilcom.json")  # opzionale FAQ curate
-MAX_LOG_MB = 8  # rotazione semplice: se > 8MB, crea logs_YYYYMMDD_HHMM.jsonl
-
 
 # ============================================================
 # SECRETS / PASSWORDS
 # ============================================================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    # Streamlit Cloud: st.secrets
     try:
         if key in st.secrets:  # type: ignore
             return str(st.secrets[key])  # type: ignore
     except Exception:
         pass
+    # Env
     return os.getenv(key, default)
+
 
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
+
 UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
 ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin debug
 OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
-
-# GitHub persistence (opzionale)
-# Metti in Secrets:
-# GITHUB_TOKEN = <token>
-# GITHUB_REPO = "tuoUser/tuoRepo"
-# GITHUB_BRANCH = "main"
-# GITHUB_LOGS_PATH = "dataset/logs.jsonl"
-GITHUB_TOKEN = get_secret("GITHUB_TOKEN")
-GITHUB_REPO = get_secret("GITHUB_REPO")  # es: "bep79/chatbot-ccnl"
-GITHUB_BRANCH = get_secret("GITHUB_BRANCH", "main")
-GITHUB_LOGS_PATH = get_secret("GITHUB_LOGS_PATH", "dataset/logs.jsonl")
 
 
 # ============================================================
@@ -110,18 +94,6 @@ st.markdown(
     "⚠️ Le risposte sono generate **solo** in base al CCNL caricato. Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
 )
 st.divider()
-
-
-# ============================================================
-# DATASET DIR ENSURE
-# ============================================================
-def ensure_dataset_dir():
-    try:
-        os.makedirs(DATASET_DIR, exist_ok=True)
-    except Exception:
-        pass
-
-ensure_dataset_dir()
 
 
 # ============================================================
@@ -142,6 +114,8 @@ if UILCOM_PASSWORD:
                 st.error("Password non corretta.")
 else:
     st.warning("Password iscritti non impostata. Imposta UILCOM_PASSWORD in Secrets (Streamlit) o variabile d’ambiente.")
+    # Per sviluppo locale puoi forzare qui:
+    # st.session_state.auth_ok = True
 
 if not st.session_state.auth_ok:
     st.stop()
@@ -183,8 +157,11 @@ with st.sidebar:
     st.write("Indice presente:", "✅" if ok_index else "❌")
 
     if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
+        # Rebuild
         try:
             with st.spinner("Indicizzazione in corso..."):
+                n = None
+
                 if not os.path.exists(PDF_PATH):
                     raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
 
@@ -199,8 +176,9 @@ with st.sidebar:
                 chunks = splitter.split_documents(docs)
 
                 texts = [c.page_content for c in chunks]
-                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # 1-based
+                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based
 
+                # Embeddings
                 if not OPENAI_API_KEY:
                     raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
 
@@ -216,7 +194,9 @@ with st.sidebar:
                         ensure_ascii=False,
                     )
 
-            st.success(f"Indicizzazione completata. Chunk: {len(chunks)}")
+                n = len(chunks)
+
+            st.success(f"Indicizzazione completata. Chunk: {n}")
             st.rerun()
         except Exception as e:
             st.error(str(e))
@@ -226,7 +206,7 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.caption("Dopo modifiche su GitHub, Streamlit Cloud in genere fa auto-redeploy. Se no: **Reboot app**.")
+    st.caption("Suggerimento: dopo modifiche a app.py su GitHub, Streamlit Cloud fa auto-redeploy. Se no: **Reboot app**.")
 
 
 # ============================================================
@@ -242,149 +222,16 @@ if not OPENAI_API_KEY:
 
 
 # ============================================================
-# LOGGING (JSONL) + ROTATION
-# ============================================================
-def rotate_log_if_needed():
-    try:
-        if os.path.exists(LOG_PATH):
-            size_mb = os.path.getsize(LOG_PATH) / (1024 * 1024)
-            if size_mb >= MAX_LOG_MB:
-                ts = datetime.now().strftime("%Y%m%d_%H%M")
-                new_name = os.path.join(DATASET_DIR, f"logs_{ts}.jsonl")
-                os.rename(LOG_PATH, new_name)
-    except Exception:
-        pass
-
-def append_log(record: Dict[str, Any]) -> None:
-    ensure_dataset_dir()
-    rotate_log_if_needed()
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-    except Exception:
-        # se non riesce a scrivere, non blocchiamo la chat
-        pass
-
-def read_logs(limit: int = 200) -> List[Dict[str, Any]]:
-    if not os.path.exists(LOG_PATH):
-        return []
-    out: List[Dict[str, Any]] = []
-    try:
-        with open(LOG_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    out.append(json.loads(line))
-                except Exception:
-                    continue
-    except Exception:
-        return []
-    return out[-limit:]
-
-
-# ============================================================
-# GITHUB PUSH (optional)
-# ============================================================
-def github_api_headers() -> Dict[str, str]:
-    return {
-        "Authorization": f"token {GITHUB_TOKEN}",
-        "Accept": "application/vnd.github+json",
-    }
-
-def github_get_file_sha_and_content(path_in_repo: str) -> Tuple[Optional[str], Optional[str]]:
-    """Return (sha, content_text) if exists, else (None, None)"""
-    if not (GITHUB_TOKEN and GITHUB_REPO):
-        return None, None
-
-    import requests  # allowed dependency in Streamlit env typically
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path_in_repo}"
-    params = {"ref": GITHUB_BRANCH}
-    r = requests.get(url, headers=github_api_headers(), params=params, timeout=20)
-    if r.status_code == 200:
-        data = r.json()
-        sha = data.get("sha")
-        content_b64 = data.get("content", "")
-        try:
-            content_text = base64.b64decode(content_b64).decode("utf-8", errors="ignore")
-        except Exception:
-            content_text = ""
-        return sha, content_text
-    return None, None
-
-def github_put_file(path_in_repo: str, new_content_text: str, message: str) -> bool:
-    if not (GITHUB_TOKEN and GITHUB_REPO):
-        return False
-
-    import requests
-
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path_in_repo}"
-    sha, _old = github_get_file_sha_and_content(path_in_repo)
-
-    payload = {
-        "message": message,
-        "content": base64.b64encode(new_content_text.encode("utf-8")).decode("utf-8"),
-        "branch": GITHUB_BRANCH,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    r = requests.put(url, headers=github_api_headers(), json=payload, timeout=25)
-    return r.status_code in (200, 201)
-
-def push_local_logs_to_github() -> Tuple[bool, str]:
-    if not os.path.exists(LOG_PATH):
-        return False, "Non esiste dataset/logs.jsonl localmente."
-
-    if not (GITHUB_TOKEN and GITHUB_REPO):
-        return False, "Mancano GITHUB_TOKEN o GITHUB_REPO nei Secrets."
-
-    try:
-        with open(LOG_PATH, "r", encoding="utf-8") as f:
-            local = f.read()
-    except Exception as e:
-        return False, f"Errore lettura log: {e}"
-
-    # strategy: append al file remoto (se esiste) + dedup semplice
-    sha, remote = github_get_file_sha_and_content(GITHUB_LOGS_PATH)
-    if remote is None:
-        remote = ""
-
-    # Dedup: usiamo hash linea
-    remote_lines = [ln for ln in remote.splitlines() if ln.strip()]
-    local_lines = [ln for ln in local.splitlines() if ln.strip()]
-    seen = set(hashlib.sha1(ln.encode("utf-8")).hexdigest() for ln in remote_lines)
-    merged = remote_lines[:]
-    added = 0
-    for ln in local_lines:
-        h = hashlib.sha1(ln.encode("utf-8")).hexdigest()
-        if h not in seen:
-            merged.append(ln)
-            seen.add(h)
-            added += 1
-
-    new_text = "\n".join(merged) + ("\n" if merged else "")
-    ok = github_put_file(
-        GITHUB_LOGS_PATH,
-        new_text,
-        message=f"Update logs ({added} new records) - {datetime.now().isoformat(timespec='seconds')}",
-    )
-    if ok:
-        return True, f"Caricati su GitHub. Nuove righe aggiunte: {added}"
-    return False, "GitHub PUT fallito (controlla token/permessi/branch)."
-
-
-# ============================================================
 # RETRIEVAL HELPERS
 # ============================================================
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
 
+
 def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     return mat_norm @ q
+
 
 def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
     vectors = np.load(VEC_PATH)
@@ -409,6 +256,8 @@ MANSIONI_TRIGGERS = [
     "mansioni superiori", "mansione superiore", "mansioni più alte", "mansioni piu alte",
     "categoria superiore", "livello superiore", "passaggio di categoria", "cambio categoria",
     "inquadramento superiore", "posto vacante", "sostituzione", "sto sostituendo",
+    "differenza paga", "differenza di paga", "pagato di più", "pagato di piu",
+    "trattamento corrispondente", "retribuzione corrispondente",
 ]
 
 CONSERVAZIONE_TRIGGERS = [
@@ -473,6 +322,7 @@ def is_straordinario_notturno_question(q: str) -> bool:
 
 def is_lavoro_notturno_question(q: str) -> bool:
     ql = q.lower()
+    # lavoro notturno "ordinario": notturno ma NON straordinario
     return ("notturn" in ql) and ("straordin" not in ql)
 
 
@@ -560,37 +410,37 @@ def build_queries(q: str) -> List[str]:
     user_is_mans = is_mansioni_question(q0)
     user_is_conserv = is_conservazione_context(q0)
 
+    # ========== ROL / ex festività ==========
     if user_is_rol:
         qs += [
             "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
             "festività soppresse abolite riposi retribuiti quanti giorni",
             "festività infrasettimanali abolite riposi retribuiti",
             "riposi retribuiti in sostituzione delle festività abolite",
-            "modalità richiesta fruizione ROL e riposi festività abolite preavviso programmazione",
-            "residui ROL scadenze eventuale monetizzazione (se prevista)",
         ]
 
+    # ========== Permessi generici ==========
     if user_is_perm and (not user_is_rol):
         qs += [
             "permessi retribuiti tipologie CCNL elenco completo",
             "assenze retribuite tipologie visite mediche lutto matrimonio 104 sindacali studio donazione sangue",
             "permessi sindacali assemblea ore retribuite",
             "diritto allo studio 150 ore triennio permessi retribuiti",
-            "permessi per esami lavoratori studenti una settimana di calendario all'anno",
+        ]
+        qs += [
             "ROL riduzione orario di lavoro riposi retribuiti",
             "festività soppresse abolite riposi retribuiti",
         ]
 
+    # ========== Malattia ==========
     if user_is_mal:
         qs += [
             "malattia trattamento economico percentuali integrazione",
             "malattia periodo di comporto regole conteggio",
-            "malattia obblighi comunicazione certificazione",
-            "controlli visite fiscali reperibilità fasce",
-            "malattia durante ferie sospensione ferie",
-            "ricovero ospedaliero day hospital ricaduta",
+            "visite fiscali reperibilità fasce",
         ]
 
+    # ========== Straordinari / notturno ==========
     if any(t in qlow for t in STRAORDINARI_TRIGGERS):
         qs += [
             "lavoro straordinario maggiorazioni limiti",
@@ -600,14 +450,14 @@ def build_queries(q: str) -> List[str]:
             "lavoro festivo maggiorazioni",
         ]
 
+    # ========== Mansioni superiori / categoria ==========
     if user_is_mans or user_is_conserv:
         qs += [
             "mansioni superiori regole generali posto vacante",
-            "mansioni superiori 30 giorni consecutivi 60 giorni discontinui",
-            "assegnazione a mansioni superiori effetti inquadramento",
+            "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
+            "assegnazione a mansioni superiori trattamento corrispondente",
             "non si applica in caso di sostituzione di dipendente assente con diritto alla conservazione del posto",
-            "trattamento economico durante mansioni superiori",
-            "formazione addestramento affiancamento non costituisce mansioni superiori",
+            "inquadramento superiore effetti",
         ]
 
     out, seen = [], set()
@@ -624,19 +474,10 @@ def build_queries(q: str) -> List[str]:
 # ============================================================
 def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
     patterns = [
-        r"\b30\b", r"\b60\b", r"\b\d{1,3}\b", r"%",
+        r"\b30\b", r"\b60\b", r"%", r"tre\s+mesi", r"\b3\s+mesi\b",
         r"posto\s+vacante", r"mansioni?\s+superiori?", r"sostituzion",
         r"conservazion.*posto", r"diritto.*conservazion.*posto",
-        r"non\s+si\s+applica", r"non\s+costituisc",
-        r"affiancament", r"addestrament", r"formazion",
-        r"\brol\b", r"riduzione\s+orario",
-        r"festivit", r"soppresse", r"abolite", r"infrasettimanali",
-        r"notturn", r"straordin", r"maggior",
-        r"permess", r"assenze?\s+retribuit",
-        r"assemblea", r"sindacal", r"\b104\b",
-        r"diritto\s+allo\s+studio", r"\b150\s+ore\b",
-        r"malatt", r"comporto", r"certificat", r"reperibil", r"visita\s+fiscale",
-        r"differenza\s+retribut", r"differenze\s+retribut", r"arretrat", r"conguaglio"
+        r"trattamento\s+corrispondente", r"retribuzion",
     ]
 
     evidences: List[str] = []
@@ -658,10 +499,6 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
             seen.add(e)
     return out[:MAX_EVIDENCE_LINES]
 
-def evidence_has_30_60(evidence_lines: List[str]) -> bool:
-    joined = " ".join(evidence_lines).lower()
-    return (re.search(r"\b30\b", joined) is not None) and (re.search(r"\b60\b", joined) is not None)
-
 
 # ============================================================
 # OPTIONAL BM25 RERANK (precision boost)
@@ -677,50 +514,134 @@ def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, 
 
 
 # ============================================================
-# OPTIONAL DATASET (FAQ curata)
+# ⭐ HARD GUARDRAIL: MANSIONI SUPERIORI (NO LLM)
 # ============================================================
-def load_dataset_uilcom() -> List[Dict[str, Any]]:
-    if not os.path.exists(DATASET_UILCOM_PATH):
-        return []
-    try:
-        with open(DATASET_UILCOM_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-    except Exception:
-        pass
-    return []
+def _find_snippets(patterns: List[str], chunks: List[Dict[str, Any]], max_hits: int = 6) -> List[Dict[str, Any]]:
+    hits = []
+    for c in chunks:
+        txt = (c.get("text") or "")
+        tl = txt.lower()
+        if any(re.search(p, tl, flags=re.IGNORECASE) for p in patterns):
+            hits.append({"page": c.get("page", "?"), "text": txt})
+            if len(hits) >= max_hits:
+                break
+    return hits
 
-DATASET_UILCOM = load_dataset_uilcom()
+def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Cerca prove “specifiche CCNL” 30/60
+    patt_30 = [r"\b30\b.*giorn", r"trenta.*giorn"]
+    patt_60 = [r"\b60\b.*giorn", r"sessanta.*giorn"]
+    patt_consec = [r"consecutiv", r"continuativ"]
+    patt_non_consec = [r"non\s+consecutiv", r"discontinu", r"non\s+continuativ"]
+    patt_tratt = [r"trattamento\s+corrispondente", r"retribuzion.*corrispond", r"diritto\s+al\s+trattamento"]
+    patt_esclus = [r"non\s+.*applica", r"sostituzion", r"conservazion.*posto", r"diritto.*conservazion.*posto"]
 
-def dataset_match_answer(user_q: str) -> Optional[str]:
-    """
-    Matching leggero: se troviamo una FAQ con keywords presenti nella domanda, restituiamo answer.
-    Nota: NON inventa. Serve a stabilizzare le risposte ricorrenti che TU hai validato.
-    """
+    txt_all = " ".join([(c.get("text") or "").lower() for c in chunks])
+
+    found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
+    found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
+
+    # Prova più “strict”: 30+consecutivi e 60+non consecutivi
+    found_30_consec = (re.search(r"\b30\b", txt_all) is not None) and (re.search(r"consecutiv|continuativ", txt_all) is not None)
+    found_60_nonconsec = (re.search(r"\b60\b", txt_all) is not None) and (re.search(r"non\s+consecutiv|discontinu|non\s+continuativ", txt_all) is not None)
+
+    has_trattamento = re.search(r"trattamento\s+corrispondente|diritto\s+al\s+trattamento|retribuzion.*corrispond", txt_all) is not None
+    has_esclusione = re.search(r"sostituzion.*conservazion|diritto.*conservazion.*posto|non\s+.*applica", txt_all) is not None
+
+    # “3 mesi” è tipico della norma generale: lo segnaliamo ma NON lo useremo se troviamo 30/60
+    has_3_mesi = re.search(r"tre\s+mesi|\b3\s+mesi\b", txt_all) is not None
+
+    snip_30 = _find_snippets(patt_30 + patt_consec, chunks)
+    snip_60 = _find_snippets(patt_60 + patt_non_consec, chunks)
+    snip_tratt = _find_snippets(patt_tratt, chunks)
+    snip_escl = _find_snippets(patt_esclus, chunks)
+
+    return {
+        "found_30": found_30,
+        "found_60": found_60,
+        "found_30_consec": found_30_consec,
+        "found_60_nonconsec": found_60_nonconsec,
+        "has_trattamento": has_trattamento,
+        "has_esclusione": has_esclusione,
+        "has_3_mesi": has_3_mesi,
+        "snip_30": snip_30,
+        "snip_60": snip_60,
+        "snip_tratt": snip_tratt,
+        "snip_escl": snip_escl,
+    }
+
+def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     ql = user_q.lower()
-    best = None
-    best_score = 0
-    for item in DATASET_UILCOM:
-        keys = item.get("keywords", [])
-        ans = item.get("answer", "")
-        if not ans or not isinstance(keys, list):
-            continue
-        score = 0
-        for k in keys:
-            if isinstance(k, str) and k.lower() in ql:
-                score += 1
-        if score > best_score:
-            best_score = score
-            best = ans
-    # richiedi almeno 2 match per evitare risposte sbagliate
-    if best and best_score >= 2:
-        return str(best).strip()
-    return None
+
+    # Se CCNL dice “trattamento corrispondente”, la differenza paga è “subito” per i giorni svolti
+    diff_paga = rules.get("has_trattamento", False)
+
+    # Soglie passaggio definitivo: SOLO se trovi 30/60 nel CCNL
+    has_30_60 = bool(rules.get("found_30", False) and rules.get("found_60", False))
+
+    # Costruzione risposta
+    parts = []
+
+    # 1) Differenza paga
+    if any(x in ql for x in ["pagato", "pagata", "differenza", "trattamento", "retribuzione", "piu", "più"]):
+        if diff_paga:
+            parts.append("Se vieni adibito a **mansioni superiori**, hai diritto al **trattamento economico corrispondente all’attività svolta** per i giorni/periodi in cui le svolgi.")
+        else:
+            parts.append("Nel CCNL caricato **non trovo** una previsione esplicita sulla **differenza retributiva immediata** per mansioni superiori.")
+
+    # 2) Passaggio / categoria definitiva
+    if any(x in ql for x in ["categoria", "livello", "passaggio", "inquadramento", "definitiv"]):
+        if has_30_60:
+            parts.append("Per il **passaggio (stabilizzazione) alla categoria/livello superiore**: dal CCNL risultano le soglie di **30 giorni consecutivi** oppure **60 giorni non consecutivi** di adibizione a mansioni superiori.")
+        else:
+            parts.append("Nel CCNL caricato **non trovo** la regola specifica sui giorni (es. 30/60) per la stabilizzazione del livello.")
+
+    # 3) Eccezione sostituzione conservazione posto
+    if rules.get("has_esclusione", False):
+        parts.append("⚠️ Attenzione: se l’assegnazione avviene per **sostituzione di un lavoratore assente con diritto alla conservazione del posto**, possono applicarsi **limitazioni/esclusioni** previste dal CCNL.")
+
+    # 4) Caso “pochi giorni” (3 giorni ecc.)
+    m = re.search(r"\b(\d{1,3})\s+giorn", ql)
+    if m:
+        gg = int(m.group(1))
+        if gg <= 10 and diff_paga:
+            parts.append(f"Quindi, se parli di **{gg} giorni**, in base al CCNL hai diritto alla **retribuzione corrispondente** per quei giorni; la **stabilizzazione** (passaggio definitivo) richiede invece le soglie indicate (30/60) se previste nel CCNL.")
+
+    # Fallback minimo
+    if not parts:
+        if has_30_60:
+            parts.append("Per mansioni superiori: dal CCNL risultano le soglie di **30 giorni consecutivi** o **60 giorni non consecutivi** per la stabilizzazione del livello, e le eventuali eccezioni in caso di sostituzione con conservazione del posto.")
+        elif diff_paga:
+            parts.append("Per mansioni superiori: dal CCNL risulta il diritto al **trattamento corrispondente** all’attività svolta.")
+        else:
+            parts.append("Non ho trovato la risposta nel CCNL caricato.")
+
+    return "\n\n".join(parts).strip()
+
+def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
+    lines = []
+    lines.append(f"- found_30: {rules.get('found_30')}, found_60: {rules.get('found_60')}")
+    lines.append(f"- has_trattamento: {rules.get('has_trattamento')}")
+    lines.append(f"- has_esclusione: {rules.get('has_esclusione')}")
+    lines.append(f"- has_3_mesi: {rules.get('has_3_mesi')} (IGNORATO se 30/60 presenti)")
+    def fmt(snips: List[Dict[str, Any]], title: str):
+        if not snips:
+            lines.append(f"- {title}: (nessuno)")
+            return
+        lines.append(f"- {title}:")
+        for s in snips[:4]:
+            p = s.get("page", "?")
+            t = " ".join((s.get("text","") or "").split())
+            lines.append(f"  • (pag. {p}) {t[:240]}{'...' if len(t)>240 else ''}")
+    fmt(rules.get("snip_tratt", []), "Evidenze trattamento corrispondente")
+    fmt(rules.get("snip_30", []), "Evidenze 30 giorni")
+    fmt(rules.get("snip_60", []), "Evidenze 60 giorni")
+    fmt(rules.get("snip_escl", []), "Evidenze esclusioni (sostituzione/conservazione)")
+    return "\n".join(lines)
 
 
 # ============================================================
-# SYSTEM RULES
+# SYSTEM RULES (core)
 # ============================================================
 RULES = """
 Sei l’assistente UILCOM per lavoratori IPZS.
@@ -732,17 +653,14 @@ REGOLE IMPORTANTI:
 2) NON confondere lavoro notturno con straordinario notturno:
    - Se la domanda è "lavoro notturno" (ordinario), usa solo regole/percentuali del notturno ordinario.
    - Se nel contesto trovi solo "straordinario notturno", devi dirlo e NON applicarlo al notturno ordinario.
-3) MANSIONI SUPERIORI / CATEGORIA:
-   - Se nel contesto emergono 30 giorni consecutivi / 60 giorni non consecutivi, questi vanno riportati.
-   - Se nel contesto emerge la distinzione posto vacante vs sostituzione con conservazione del posto, riportala chiaramente.
-4) TERMINOLOGIA EX FESTIVITÀ:
+3) TERMINOLOGIA EX FESTIVITÀ:
    - Se l’utente dice "ex festività" ma nel CCNL trovi "festività soppresse/abolite/infrasettimanali abolite",
      spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
-5) Permessi:
+4) Permessi:
    - Elenca SOLO le tipologie che trovi nel contesto.
    - Se l’utente chiede "tutti i permessi", includi anche ROL/festività abolite solo se compaiono nel contesto recuperato.
-6) Output: prepara una risposta pulita per l’utente (senza citare pagine).
-   Le pagine/estratti vanno messi SOLO nella sezione ADMIN.
+5) Output: risposta pulita per l’utente (senza citare pagine).
+   Pagine/estratti SOLO nella sezione ADMIN.
 
 FORMATO OUTPUT OBBLIGATORIO:
 
@@ -763,59 +681,10 @@ FORMATO OUTPUT OBBLIGATORIO:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-
-# ============================================================
-# ADMIN: LOG VIEWER PANEL
-# ============================================================
-if st.session_state.is_admin:
-    with st.expander("🧾 Admin: Logs (monitoraggio)", expanded=False):
-        logs = read_logs(limit=400)
-
-        # Controls
-        c1, c2, c3 = st.columns([2, 1, 1])
-        with c1:
-            qfilter = st.text_input("Filtro testo (domanda/risposta)", value="")
-        with c2:
-            limit = st.number_input("Mostra ultime", min_value=20, max_value=400, value=120, step=20)
-        with c3:
-            st.write("")
-            st.write("")
-
-        view = logs[-int(limit):]
-        if qfilter.strip():
-            qf = qfilter.lower().strip()
-            view = [r for r in view if (qf in str(r.get("question", "")).lower()) or (qf in str(r.get("public_answer", "")).lower())]
-
-        # Quick stats
-        st.caption(f"Record totali letti: {len(logs)} | Visualizzati: {len(view)}")
-        not_found = sum(1 for r in view if "non ho trovato" in str(r.get("public_answer","")).lower())
-        st.caption(f"Non trovato (nel range mostrato): {not_found}")
-
-        # Download logs.jsonl
-        if os.path.exists(LOG_PATH):
-            with open(LOG_PATH, "rb") as f:
-                st.download_button("⬇️ Scarica logs.jsonl", f, file_name="logs.jsonl", use_container_width=True)
-
-        # Push to GitHub
-        if GITHUB_TOKEN and GITHUB_REPO:
-            if st.button("☁️ Push logs su GitHub", use_container_width=True):
-                ok, msg = push_local_logs_to_github()
-                if ok:
-                    st.success(msg)
-                else:
-                    st.error(msg)
-        else:
-            st.info("Per persistenza vera su Streamlit Cloud: imposta in Secrets GITHUB_TOKEN e GITHUB_REPO.")
-
-
-# ============================================================
-# RENDER CHAT (pulita)
-# ============================================================
+# Render chat (pulita)
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
-
-        # Admin-only debug for assistant messages
         if st.session_state.is_admin and m["role"] == "assistant":
             dbg = m.get("debug", None)
             if dbg:
@@ -826,6 +695,9 @@ for m in st.session_state.messages:
                     st.code("\n".join(dbg.get("queries", [])))
                     st.write("**Evidenze estratte:**")
                     st.code("\n".join(dbg.get("evidence", [])) or "(nessuna)")
+                    if dbg.get("mansioni_guardrail"):
+                        st.write("**Guardrail mansioni (deterministico):**")
+                        st.code(dbg.get("mansioni_guardrail"))
                     st.write("**Chunk selezionati (prime righe):**")
                     for c in dbg.get("selected", []):
                         st.write(f"**Pagina {c.get('page')}**")
@@ -835,6 +707,7 @@ for m in st.session_state.messages:
 
 
 user_input = st.chat_input("Scrivi una domanda sul CCNL (permessi, ROL/festività soppresse, malattia, straordinari, categorie...)")
+
 if not user_input:
     st.stop()
 
@@ -852,25 +725,6 @@ st.session_state.messages.append({"role": "user", "content": user_input})
 
 
 # ============================================================
-# FAST PATH: DATASET (FAQ curate)
-# ============================================================
-# Se matchiamo una FAQ curata, rispondiamo subito (più stabile)
-dataset_ans = dataset_match_answer(user_input)
-if dataset_ans:
-    st.session_state.messages.append({"role": "assistant", "content": dataset_ans})
-
-    # log
-    append_log({
-        "ts": datetime.now().isoformat(timespec="seconds"),
-        "question": user_input,
-        "public_answer": dataset_ans,
-        "source": "dataset_uilcom.json",
-    })
-
-    st.rerun()
-
-
-# ============================================================
 # RETRIEVAL PIPELINE
 # ============================================================
 enriched_q = build_enriched_question(user_input)
@@ -881,8 +735,8 @@ emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
 queries = build_queries(enriched_q)
 
+# Multi-query semantic retrieval
 scores_best: Dict[int, float] = {}
-
 for q in queries:
     qvec = np.array(emb.embed_query(q), dtype=np.float32)
     sims = cosine_scores(qvec, mat_norm)
@@ -892,108 +746,60 @@ for q in queries:
         if (int(i) not in scores_best) or (s > scores_best[int(i)]):
             scores_best[int(i)] = s
 
-provisional_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
-provisional_selected = [meta[i] for i in provisional_idx]
-provisional_evidence = extract_key_evidence(provisional_selected)
-
-# Guardrail: permessi coverage pass 2
-user_is_perm = is_permessi_question(enriched_q)
-user_is_rol = is_rol_exfest_question(enriched_q)
-
-if user_is_perm and (not user_is_rol):
-    cov_n, _ = permessi_category_coverage(provisional_selected)
-    if cov_n < PERMESSI_MIN_CATEGORY_COVERAGE:
-        extra_queries = build_permessi_expansion_queries(enriched_q)
-        for q in extra_queries:
-            qvec = np.array(emb.embed_query(q), dtype=np.float32)
-            sims = cosine_scores(qvec, mat_norm)
-            top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
-            for i in top_idx:
-                s = float(sims[int(i)])
-                if (int(i) not in scores_best) or (s > scores_best[int(i)]):
-                    scores_best[int(i)] = s
-
-# Re-ranking boosts
-user_is_mans = is_mansioni_question(enriched_q) or ("categoria" in enriched_q.lower())
-user_is_conserv = is_conservazione_context(enriched_q)
-user_is_notturno = is_lavoro_notturno_question(enriched_q)
-user_is_straord_notturno = is_straordinario_notturno_question(enriched_q)
-
-force_30_60 = evidence_has_30_60(provisional_evidence) and user_is_mans
-
-for i in list(scores_best.keys()):
-    txt = (meta[i].get("text") or "").lower()
-    boost = 0.0
-
-    if user_is_mans or user_is_conserv:
-        if re.search(r"\b30\b", txt) and re.search(r"\b60\b", txt):
-            boost += 0.18
-        if "posto vacante" in txt:
-            boost += 0.08
-        if "conservazione del posto" in txt or "diritto alla conservazione" in txt:
-            boost += 0.08
-        if "non si applica" in txt or "non si applicano" in txt:
-            boost += 0.07
-        if "affianc" in txt or "formaz" in txt or "addestr" in txt:
-            boost += 0.03
-
-    if user_is_rol:
-        if re.search(r"\brol\b", txt) or "riduzione orario" in txt:
-            boost += 0.16
-        if "festività soppresse" in txt or "festivita soppresse" in txt or "abolite" in txt or "infrasettimanali" in txt:
-            boost += 0.16
-        if "diritto allo studio" in txt or "150 ore" in txt:
-            boost -= 0.10
-
-    if user_is_notturno:
-        if "notturn" in txt and "straordin" not in txt:
-            boost += 0.12
-        if "straordin" in txt and "notturn" in txt:
-            boost -= 0.10
-        # penalizza pezzi che parlano di "maggiorata del 60%" ma solo in relazione a ore effettive prestate (spesso è straord.)
-        if "maggiorata del 60%" in txt and "straordin" in txt:
-            boost -= 0.08
-
-    if user_is_straord_notturno:
-        if "straordin" in txt and "notturn" in txt:
-            boost += 0.14
-
-    if user_is_perm and (not user_is_rol):
-        if "permess" in txt or "assenze retribuite" in txt:
-            boost += 0.07
-
-    scores_best[i] = scores_best[i] + boost
-
 final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
 selected = [meta[i] for i in final_idx]
 
+# Optional BM25 rerank for final precision
 selected = bm25_rerank(enriched_q, selected)
 
-context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
-
+# Evidence
 key_evidence = extract_key_evidence(selected)
+
+# ============================================================
+# ⭐ HARD GUARDRAIL MANSIONI: risposta deterministica (stop LLM)
+# ============================================================
+user_is_mans = is_mansioni_question(enriched_q) or is_conservazione_context(enriched_q)
+if user_is_mans:
+    rules_m = extract_mansioni_rules(selected)
+    public_ans = mansioni_public_answer(user_input, rules_m)
+
+    assistant_payload: Dict[str, Any] = {"role": "assistant", "content": public_ans}
+
+    if st.session_state.is_admin:
+        assistant_payload["debug"] = {
+            "enriched_q": enriched_q,
+            "queries": queries,
+            "evidence": key_evidence,
+            "selected": selected,
+            "mansioni_guardrail": mansioni_admin_debug(rules_m),
+            "bm25_available": BM25_AVAILABLE,
+        }
+
+    st.session_state.messages.append(assistant_payload)
+    st.rerun()
+
+
+# ============================================================
+# LLM CALL (tutto il resto)
+# ============================================================
+context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
 evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
 
-guardrail_mansioni = ""
-if force_30_60:
-    guardrail_mansioni = "GUARDRAIL MANSIONI: nel contesto emergono 30/60. Devi riportare questi valori se parli di passaggio categoria/mansioni superiori.\n"
-
 guardrail_notturno = ""
-if user_is_notturno:
-    guardrail_notturno = "GUARDRAIL NOTTURNO: domanda su lavoro notturno ordinario. NON usare percentuali di straordinario notturno.\n"
-elif user_is_straord_notturno:
-    guardrail_notturno = "GUARDRAIL STRAORD. NOTTURNO: domanda su straordinario notturno. Usa SOLO percentuali di straordinario notturno.\n"
+if is_lavoro_notturno_question(enriched_q):
+    guardrail_notturno = (
+        "GUARDRAIL NOTTURNO: la domanda è su lavoro notturno (ordinario). NON usare percentuali di straordinario notturno.\n"
+    )
+elif is_straordinario_notturno_question(enriched_q):
+    guardrail_notturno = (
+        "GUARDRAIL STRAORD. NOTTURNO: la domanda è su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
+    )
 
-
-# ============================================================
-# LLM CALL
-# ============================================================
 llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
 
 prompt = f"""
 {RULES}
 
-{guardrail_mansioni}
 {guardrail_notturno}
 
 DOMANDA (UTENTE):
@@ -1002,7 +808,7 @@ DOMANDA (UTENTE):
 DOMANDA ARRICCHITA (MEMORIA BREVE):
 {enriched_q}
 
-EVIDENZE (se presenti, operative):
+EVIDENZE (se presenti, sono operative):
 {evidence_block}
 
 CONTESTO CCNL (estratti):
@@ -1022,7 +828,6 @@ def split_public_admin(text: str) -> Tuple[str, str]:
         pub = m_pub.group(1).strip()
     else:
         pub = text.strip()
-
     if m_adm:
         adm = m_adm.group(1).strip()
     return pub, adm
@@ -1033,51 +838,23 @@ except Exception as e:
     raw = f"<PUBLIC>Errore nel generare la risposta: {e}</PUBLIC><ADMIN></ADMIN>"
 
 public_ans, admin_ans = split_public_admin(raw)
-
 if not public_ans:
     public_ans = "Non ho trovato la risposta nel CCNL caricato."
 
-
-# ============================================================
-# OUTPUT + LOGGING
-# ============================================================
 assistant_payload: Dict[str, Any] = {
     "role": "assistant",
     "content": public_ans,
 }
 
-debug_bundle = {
-    "enriched_q": enriched_q,
-    "queries": queries,
-    "evidence": key_evidence,
-    "selected": selected,
-    "admin_llm_section": admin_ans,
-    "bm25_available": BM25_AVAILABLE,
-}
-
 if st.session_state.is_admin:
-    assistant_payload["debug"] = debug_bundle
-
-st.session_state.messages.append(assistant_payload)
-
-# Always log (even for normal users) — no debug visible, only stored
-append_log({
-    "ts": datetime.now().isoformat(timespec="seconds"),
-    "question": user_input,
-    "public_answer": public_ans,
-    "topic_flags": {
-        "permessi": is_permessi_question(user_input),
-        "rol_exfest": is_rol_exfest_question(user_input),
-        "malattia": is_malattia_question(user_input),
-        "mansioni": is_mansioni_question(user_input),
-        "notturno": is_lavoro_notturno_question(user_input),
-        "straord_notturno": is_straordinario_notturno_question(user_input),
-    },
-    "debug": {
+    assistant_payload["debug"] = {
+        "enriched_q": enriched_q,
         "queries": queries,
         "evidence": key_evidence,
-        "pages": [c.get("page") for c in selected],
+        "selected": selected,
+        "admin_llm_section": admin_ans,
+        "bm25_available": BM25_AVAILABLE,
     }
-})
 
+st.session_state.messages.append(assistant_payload)
 st.rerun()
