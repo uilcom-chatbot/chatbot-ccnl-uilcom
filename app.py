@@ -1,17 +1,14 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (versione definitiva)
+# app.py — Assistente Contrattuale UILCOM IPZS (pubblico con citazioni + guardrail)
 # ✅ Risposte SOLO dal CCNL
-# ✅ Utenti: risposta pulita (senza fonti)
+# ✅ Pubblico: include SEMPRE citazioni (pagine)
 # ✅ Admin: debug + evidenze + chunk/pagine usate
-# ✅ Fix: ex festività = festività soppresse/abolite/infrasettimanali abolite
-# ✅ Fix: mansioni superiori (30/60 + posto vacante + esclusione conservazione posto)
-# ✅ Fix: lavoro notturno vs straordinario notturno (non confondere %)
-# ✅ Guardrail HARD: mansioni superiori -> risposta deterministica (no "3 mesi")
-# ✅ Indice vettoriale persistente (vectors.npy + chunks.json)
+# ✅ Topic reset: se cambia argomento, NON usa memoria breve (evita contaminazioni)
+# ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
+# ✅ Mansioni superiori: risposta deterministica (NO LLM) + pagine
 
 import os
 import json
 import re
-import time
 import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -47,10 +44,12 @@ TOP_K_PER_QUERY = 12
 TOP_K_FINAL = 18
 MAX_MULTI_QUERIES = 12
 
+# Memoria: usata SOLO se stesso argomento (topic)
 MEMORY_USER_TURNS = 3
 
-# Permessi: quante categorie diverse provare a coprire
-PERMESSI_MIN_CATEGORY_COVERAGE = 3
+# Hard guardrail retrieval
+MIN_BEST_SIMILARITY = 0.24          # se max cosine < soglia => "non trovato"
+MIN_SELECTED_CHUNKS = 3             # se troppo pochi chunk => "non trovato"
 
 # Admin debug: quante righe evidenza mostrare
 MAX_EVIDENCE_LINES = 18
@@ -91,7 +90,9 @@ st.title(APP_TITLE)
 st.markdown(
     "**Accesso riservato agli iscritti UILCOM**  \n"
     "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** e norme applicabili ai lavoratori IPZS.  \n\n"
-    "⚠️ Le risposte sono generate **solo** in base al CCNL caricato. Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
+    "⚠️ Le risposte sono generate **solo** in base al CCNL caricato. "
+    "Le citazioni (pagine) sono incluse per permettere la verifica diretta. "
+    "Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
 )
 st.divider()
 
@@ -160,8 +161,6 @@ with st.sidebar:
         # Rebuild
         try:
             with st.spinner("Indicizzazione in corso..."):
-                n = None
-
                 if not os.path.exists(PDF_PATH):
                     raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
 
@@ -194,15 +193,14 @@ with st.sidebar:
                         ensure_ascii=False,
                     )
 
-                n = len(chunks)
-
-            st.success(f"Indicizzazione completata. Chunk: {n}")
+            st.success(f"Indicizzazione completata. Chunk: {len(chunks)}")
             st.rerun()
         except Exception as e:
             st.error(str(e))
 
     if st.button("🧹 Nuova chat", use_container_width=True):
         st.session_state.messages = []
+        st.session_state.last_topic = None
         st.rerun()
 
     st.divider()
@@ -247,6 +245,29 @@ def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
         else:
             fixed.append({"page": "?", "text": str(item)})
     return vectors, fixed
+
+
+def unique_pages(chunks: List[Dict[str, Any]], max_pages: int = 8) -> List[int]:
+    pages: List[int] = []
+    for c in chunks:
+        try:
+            p = int(c.get("page", 0))
+        except Exception:
+            continue
+        if p and p not in pages:
+            pages.append(p)
+        if len(pages) >= max_pages:
+            break
+    return pages
+
+
+def format_public_citations(pages: List[int]) -> str:
+    if not pages:
+        return ""
+    pages_sorted = sorted(pages)
+    if len(pages_sorted) == 1:
+        return f"**Fonte:** CCNL (pag. {pages_sorted[0]})"
+    return f"**Fonte:** CCNL (pagg. {', '.join(map(str, pages_sorted))})"
 
 
 # ============================================================
@@ -325,59 +346,32 @@ def is_lavoro_notturno_question(q: str) -> bool:
     # lavoro notturno "ordinario": notturno ma NON straordinario
     return ("notturn" in ql) and ("straordin" not in ql)
 
-
-# ============================================================
-# PERMESSI: CATEGORIE (coverage)
-# ============================================================
-PERMESSI_CATEGORIES = {
-    "rol_exfest": [r"\brol\b", r"riduzione\s+orario", r"festivit", r"soppresse", r"abolite"],
-    "visite_mediche": [r"visite?\s+med", r"specialist", r"accertament", r"struttur[ae]\s+sanitar"],
-    "lutto": [r"\blutto\b", r"decesso", r"familiare", r"grave\s+lutto"],
-    "matrimonio": [r"matrimon", r"nozz"],
-    "studio_formazione": [r"diritto\s+allo\s+studio", r"\b150\s+ore\b", r"\bstudio\b", r"\besami\b", r"formazion"],
-    "legge_104": [r"\b104\b", r"legge\s*104", r"handicap"],
-    "sindacali": [r"sindacal", r"\brsu\b", r"assemblea", r"permessi?\s+sindacal"],
-    "donazione_sangue": [r"donazion", r"sangue", r"emocomponent"],
-    "altri_permessi": [r"permessi?\s+retribuit", r"assenze?\s+retribuit", r"conged"],
-}
-
-def permessi_category_coverage(chunks: List[Dict[str, Any]]) -> Tuple[int, List[str]]:
-    joined = " ".join([(c.get("text") or "") for c in chunks]).lower()
-    found = set()
-    for cat, pats in PERMESSI_CATEGORIES.items():
-        for p in pats:
-            if re.search(p, joined, flags=re.IGNORECASE):
-                found.add(cat)
-                break
-    return len(found), sorted(found)
-
-def build_permessi_expansion_queries(user_q: str) -> List[str]:
-    base = user_q.strip()
-    qs = [
-        f"{base} ROL festività soppresse abolite riposi retribuiti",
-        f"{base} permessi visite mediche retribuiti",
-        f"{base} permessi lutto retribuiti",
-        f"{base} permessi matrimonio retribuiti",
-        f"{base} permessi legge 104 retribuiti",
-        f"{base} permessi sindacali assemblea RSU",
-        f"{base} permessi diritto allo studio 150 ore",
-        f"{base} permessi donazione sangue",
-        f"{base} assenze retribuite elenco tipologie",
-    ]
-    out, seen = [], set()
-    for x in qs:
-        x = x.strip()
-        if x and x not in seen:
-            out.append(x)
-            seen.add(x)
-    return out[:MAX_MULTI_QUERIES]
+def detect_topic(q: str) -> str:
+    """Topic per evitare che la memoria contamini argomenti diversi."""
+    ql = q.lower()
+    if is_mansioni_question(ql) or is_conservazione_context(ql):
+        return "mansioni"
+    if is_rol_exfest_question(ql):
+        return "rol_exfest"
+    if is_permessi_question(ql):
+        return "permessi"
+    if is_malattia_question(ql):
+        return "malattia"
+    if any(t in ql for t in STRAORDINARI_TRIGGERS):
+        return "straordinari_notturno_festivo"
+    return "altro"
 
 
 # ============================================================
-# MEMORIA BREVE
+# MEMORIA BREVE (solo stesso topic)
 # ============================================================
-def build_enriched_question(current_q: str) -> str:
+def build_enriched_question(current_q: str, current_topic: str) -> str:
     if "messages" not in st.session_state:
+        return current_q.strip()
+
+    # Se topic diverso dall'ultimo, non usare memoria
+    last_topic = st.session_state.get("last_topic", None)
+    if last_topic and last_topic != current_topic:
         return current_q.strip()
 
     user_msgs = [m["content"] for m in st.session_state.messages if m.get("role") == "user" and m.get("content")]
@@ -388,7 +382,7 @@ def build_enriched_question(current_q: str) -> str:
         return current_q.strip()
 
     return (
-        "CONTESTO CONVERSAZIONE (ultime richieste utente):\n"
+        "CONTESTO CONVERSAZIONE (ultime richieste utente, stesso argomento):\n"
         + "\n".join([f"- {x}" for x in last])
         + "\n\nDOMANDA ATTUALE:\n"
         + current_q.strip()
@@ -426,8 +420,6 @@ def build_queries(q: str) -> List[str]:
             "assenze retribuite tipologie visite mediche lutto matrimonio 104 sindacali studio donazione sangue",
             "permessi sindacali assemblea ore retribuite",
             "diritto allo studio 150 ore triennio permessi retribuiti",
-        ]
-        qs += [
             "ROL riduzione orario di lavoro riposi retribuiti",
             "festività soppresse abolite riposi retribuiti",
         ]
@@ -528,7 +520,6 @@ def _find_snippets(patterns: List[str], chunks: List[Dict[str, Any]], max_hits: 
     return hits
 
 def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Cerca prove “specifiche CCNL” 30/60
     patt_30 = [r"\b30\b.*giorn", r"trenta.*giorn"]
     patt_60 = [r"\b60\b.*giorn", r"sessanta.*giorn"]
     patt_consec = [r"consecutiv", r"continuativ"]
@@ -541,20 +532,25 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
     found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
 
-    # Prova più “strict”: 30+consecutivi e 60+non consecutivi
     found_30_consec = (re.search(r"\b30\b", txt_all) is not None) and (re.search(r"consecutiv|continuativ", txt_all) is not None)
     found_60_nonconsec = (re.search(r"\b60\b", txt_all) is not None) and (re.search(r"non\s+consecutiv|discontinu|non\s+continuativ", txt_all) is not None)
 
     has_trattamento = re.search(r"trattamento\s+corrispondente|diritto\s+al\s+trattamento|retribuzion.*corrispond", txt_all) is not None
     has_esclusione = re.search(r"sostituzion.*conservazion|diritto.*conservazion.*posto|non\s+.*applica", txt_all) is not None
-
-    # “3 mesi” è tipico della norma generale: lo segnaliamo ma NON lo useremo se troviamo 30/60
     has_3_mesi = re.search(r"tre\s+mesi|\b3\s+mesi\b", txt_all) is not None
 
     snip_30 = _find_snippets(patt_30 + patt_consec, chunks)
     snip_60 = _find_snippets(patt_60 + patt_non_consec, chunks)
     snip_tratt = _find_snippets(patt_tratt, chunks)
     snip_escl = _find_snippets(patt_esclus, chunks)
+
+    pages = set()
+    for arr in (snip_30, snip_60, snip_tratt, snip_escl):
+        for s in arr:
+            try:
+                pages.add(int(s.get("page", 0)))
+            except Exception:
+                pass
 
     return {
         "found_30": found_30,
@@ -568,53 +564,54 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
         "snip_60": snip_60,
         "snip_tratt": snip_tratt,
         "snip_escl": snip_escl,
+        "pages": sorted([p for p in pages if p]),
     }
 
 def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     ql = user_q.lower()
 
-    # Se CCNL dice “trattamento corrispondente”, la differenza paga è “subito” per i giorni svolti
     diff_paga = rules.get("has_trattamento", False)
-
-    # Soglie passaggio definitivo: SOLO se trovi 30/60 nel CCNL
     has_30_60 = bool(rules.get("found_30", False) and rules.get("found_60", False))
 
-    # Costruzione risposta
     parts = []
 
-    # 1) Differenza paga
     if any(x in ql for x in ["pagato", "pagata", "differenza", "trattamento", "retribuzione", "piu", "più"]):
         if diff_paga:
             parts.append("Se vieni adibito a **mansioni superiori**, hai diritto al **trattamento economico corrispondente all’attività svolta** per i giorni/periodi in cui le svolgi.")
         else:
-            parts.append("Nel CCNL caricato **non trovo** una previsione esplicita sulla **differenza retributiva immediata** per mansioni superiori.")
+            parts.append("Nel CCNL caricato **non trovo** una previsione esplicita sulla **differenza retributiva** per mansioni superiori (nel materiale recuperato).")
 
-    # 2) Passaggio / categoria definitiva
     if any(x in ql for x in ["categoria", "livello", "passaggio", "inquadramento", "definitiv"]):
         if has_30_60:
             parts.append("Per il **passaggio (stabilizzazione) alla categoria/livello superiore**: dal CCNL risultano le soglie di **30 giorni consecutivi** oppure **60 giorni non consecutivi** di adibizione a mansioni superiori.")
         else:
-            parts.append("Nel CCNL caricato **non trovo** la regola specifica sui giorni (es. 30/60) per la stabilizzazione del livello.")
+            parts.append("Nel CCNL caricato **non trovo** nel materiale recuperato la regola specifica sui giorni (es. 30/60) per la stabilizzazione del livello.")
 
-    # 3) Eccezione sostituzione conservazione posto
     if rules.get("has_esclusione", False):
         parts.append("⚠️ Attenzione: se l’assegnazione avviene per **sostituzione di un lavoratore assente con diritto alla conservazione del posto**, possono applicarsi **limitazioni/esclusioni** previste dal CCNL.")
 
-    # 4) Caso “pochi giorni” (3 giorni ecc.)
     m = re.search(r"\b(\d{1,3})\s+giorn", ql)
     if m:
         gg = int(m.group(1))
         if gg <= 10 and diff_paga:
-            parts.append(f"Quindi, se parli di **{gg} giorni**, in base al CCNL hai diritto alla **retribuzione corrispondente** per quei giorni; la **stabilizzazione** (passaggio definitivo) richiede invece le soglie indicate (30/60) se previste nel CCNL.")
+            parts.append(
+                f"Quindi, se parli di **{gg} giorni**, in base al CCNL hai diritto alla **retribuzione corrispondente** per quei giorni; "
+                "la **stabilizzazione** (passaggio definitivo) richiede invece le soglie indicate (30/60) se previste nel CCNL."
+            )
 
-    # Fallback minimo
     if not parts:
         if has_30_60:
             parts.append("Per mansioni superiori: dal CCNL risultano le soglie di **30 giorni consecutivi** o **60 giorni non consecutivi** per la stabilizzazione del livello, e le eventuali eccezioni in caso di sostituzione con conservazione del posto.")
         elif diff_paga:
             parts.append("Per mansioni superiori: dal CCNL risulta il diritto al **trattamento corrispondente** all’attività svolta.")
         else:
-            parts.append("Non ho trovato la risposta nel CCNL caricato.")
+            parts.append("Non ho trovato la risposta nel CCNL caricato (nel materiale recuperato).")
+
+    # Citazioni pubbliche
+    pages = rules.get("pages", []) or []
+    cit = format_public_citations([p for p in pages if isinstance(p, int)])
+    if cit:
+        parts.append(cit)
 
     return "\n\n".join(parts).strip()
 
@@ -624,6 +621,7 @@ def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
     lines.append(f"- has_trattamento: {rules.get('has_trattamento')}")
     lines.append(f"- has_esclusione: {rules.get('has_esclusione')}")
     lines.append(f"- has_3_mesi: {rules.get('has_3_mesi')} (IGNORATO se 30/60 presenti)")
+    lines.append(f"- pages: {rules.get('pages')}")
     def fmt(snips: List[Dict[str, Any]], title: str):
         if not snips:
             lines.append(f"- {title}: (nessuno)")
@@ -641,7 +639,7 @@ def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# SYSTEM RULES (core)
+# SYSTEM RULES (core) — PUBBLICO CON CITAZIONI
 # ============================================================
 RULES = """
 Sei l’assistente UILCOM per lavoratori IPZS.
@@ -658,14 +656,13 @@ REGOLE IMPORTANTI:
      spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
 4) Permessi:
    - Elenca SOLO le tipologie che trovi nel contesto.
-   - Se l’utente chiede "tutti i permessi", includi anche ROL/festività abolite solo se compaiono nel contesto recuperato.
-5) Output: risposta pulita per l’utente (senza citare pagine).
-   Pagine/estratti SOLO nella sezione ADMIN.
+5) PUBBLICO: devi SEMPRE includere una riga finale "Fonte: CCNL (pag. X...)" con le pagine usate.
 
 FORMATO OUTPUT OBBLIGATORIO:
 
 <PUBLIC>
 ...testo per l’utente...
+(Fonte: CCNL (pag. ...))
 </PUBLIC>
 
 <ADMIN>
@@ -680,8 +677,10 @@ FORMATO OUTPUT OBBLIGATORIO:
 # ============================================================
 if "messages" not in st.session_state:
     st.session_state.messages = []
+if "last_topic" not in st.session_state:
+    st.session_state.last_topic = None
 
-# Render chat (pulita)
+# Render chat
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -689,10 +688,12 @@ for m in st.session_state.messages:
             dbg = m.get("debug", None)
             if dbg:
                 with st.expander("🧠 Admin: Query / Evidenze / Chunk (debug)", expanded=False):
+                    st.write("**Topic:**", dbg.get("topic", ""))
                     st.write("**Domanda arricchita (memoria breve):**")
                     st.code(dbg.get("enriched_q", ""))
                     st.write("**Query usate:**")
                     st.code("\n".join(dbg.get("queries", [])))
+                    st.write("**Best similarity:**", dbg.get("best_similarity", None))
                     st.write("**Evidenze estratte:**")
                     st.code("\n".join(dbg.get("evidence", [])) or "(nessuna)")
                     if dbg.get("mansioni_guardrail"):
@@ -725,9 +726,10 @@ st.session_state.messages.append({"role": "user", "content": user_input})
 
 
 # ============================================================
-# RETRIEVAL PIPELINE
+# RETRIEVAL PIPELINE (con topic reset)
 # ============================================================
-enriched_q = build_enriched_question(user_input)
+topic = detect_topic(user_input)
+enriched_q = build_enriched_question(user_input, topic)
 
 vectors, meta = load_index()
 mat_norm = normalize_rows(vectors)
@@ -737,12 +739,16 @@ queries = build_queries(enriched_q)
 
 # Multi-query semantic retrieval
 scores_best: Dict[int, float] = {}
+best_similarity = 0.0
+
 for q in queries:
     qvec = np.array(emb.embed_query(q), dtype=np.float32)
     sims = cosine_scores(qvec, mat_norm)
     top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
     for i in top_idx:
         s = float(sims[int(i)])
+        if s > best_similarity:
+            best_similarity = s
         if (int(i) not in scores_best) or (s > scores_best[int(i)]):
             scores_best[int(i)] = s
 
@@ -755,26 +761,44 @@ selected = bm25_rerank(enriched_q, selected)
 # Evidence
 key_evidence = extract_key_evidence(selected)
 
+# Paginate citations (public)
+public_pages = unique_pages(selected, max_pages=8)
+public_cit_line = format_public_citations(public_pages)
+
+# HARD guardrail retrieval: se debole -> non rispondere
+retrieval_ok = (best_similarity >= MIN_BEST_SIMILARITY) and (len(selected) >= MIN_SELECTED_CHUNKS)
+
+def hard_not_found_message() -> str:
+    msg = "Non ho trovato la risposta nel CCNL caricato."
+    # in modalità pubblica, se non troviamo bene, NON inventiamo pagine
+    return msg
+
 # ============================================================
 # ⭐ HARD GUARDRAIL MANSIONI: risposta deterministica (stop LLM)
 # ============================================================
-user_is_mans = is_mansioni_question(enriched_q) or is_conservazione_context(enriched_q)
+user_is_mans = (topic == "mansioni")
 if user_is_mans:
-    rules_m = extract_mansioni_rules(selected)
-    public_ans = mansioni_public_answer(user_input, rules_m)
+    if not retrieval_ok:
+        public_ans = hard_not_found_message()
+    else:
+        rules_m = extract_mansioni_rules(selected)
+        public_ans = mansioni_public_answer(user_input, rules_m)
 
     assistant_payload: Dict[str, Any] = {"role": "assistant", "content": public_ans}
 
     if st.session_state.is_admin:
         assistant_payload["debug"] = {
+            "topic": topic,
             "enriched_q": enriched_q,
             "queries": queries,
             "evidence": key_evidence,
             "selected": selected,
-            "mansioni_guardrail": mansioni_admin_debug(rules_m),
+            "best_similarity": best_similarity,
+            "mansioni_guardrail": mansioni_admin_debug(extract_mansioni_rules(selected)) if retrieval_ok else "(retrieval debole: guardrail non applicato)",
             "bm25_available": BM25_AVAILABLE,
         }
 
+    st.session_state.last_topic = topic
     st.session_state.messages.append(assistant_payload)
     st.rerun()
 
@@ -782,6 +806,23 @@ if user_is_mans:
 # ============================================================
 # LLM CALL (tutto il resto)
 # ============================================================
+if not retrieval_ok:
+    assistant_payload: Dict[str, Any] = {"role": "assistant", "content": hard_not_found_message()}
+    if st.session_state.is_admin:
+        assistant_payload["debug"] = {
+            "topic": topic,
+            "enriched_q": enriched_q,
+            "queries": queries,
+            "evidence": key_evidence,
+            "selected": selected,
+            "best_similarity": best_similarity,
+            "bm25_available": BM25_AVAILABLE,
+            "note": "retrieval_ok=False -> risposta bloccata",
+        }
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(assistant_payload)
+    st.rerun()
+
 context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
 evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
 
@@ -805,7 +846,7 @@ prompt = f"""
 DOMANDA (UTENTE):
 {user_input}
 
-DOMANDA ARRICCHITA (MEMORIA BREVE):
+DOMANDA ARRICCHITA (MEMORIA BREVE - solo stesso topic):
 {enriched_q}
 
 EVIDENZE (se presenti, sono operative):
@@ -815,8 +856,8 @@ CONTESTO CCNL (estratti):
 {context}
 
 RICORDA:
-- Nel PUBLIC: risposta pulita, senza pagine.
-- Nel ADMIN: inserisci elenco pagine trovate e 5-10 righe evidenza più importanti con (pag. X).
+- Nel PUBLIC: risposta pulita MA con citazione finale "Fonte: CCNL (pag. ...)".
+- Nel ADMIN: inserisci elenco pagine trovate e 5-10 righe evidenza importanti con (pag. X).
 """
 
 def split_public_admin(text: str) -> Tuple[str, str]:
@@ -838,8 +879,15 @@ except Exception as e:
     raw = f"<PUBLIC>Errore nel generare la risposta: {e}</PUBLIC><ADMIN></ADMIN>"
 
 public_ans, admin_ans = split_public_admin(raw)
-if not public_ans:
-    public_ans = "Non ho trovato la risposta nel CCNL caricato."
+public_ans = (public_ans or "").strip()
+
+# Post-guardrail: se modello “dimentica” la fonte, la aggiungiamo noi (solo se abbiamo pagine)
+if public_ans:
+    has_source = bool(re.search(r"\bfonte\b\s*:", public_ans, flags=re.IGNORECASE))
+    if (not has_source) and public_cit_line:
+        public_ans = public_ans.rstrip() + "\n\n" + public_cit_line
+else:
+    public_ans = hard_not_found_message()
 
 assistant_payload: Dict[str, Any] = {
     "role": "assistant",
@@ -848,13 +896,16 @@ assistant_payload: Dict[str, Any] = {
 
 if st.session_state.is_admin:
     assistant_payload["debug"] = {
+        "topic": topic,
         "enriched_q": enriched_q,
         "queries": queries,
         "evidence": key_evidence,
         "selected": selected,
+        "best_similarity": best_similarity,
         "admin_llm_section": admin_ans,
         "bm25_available": BM25_AVAILABLE,
     }
 
+st.session_state.last_topic = topic
 st.session_state.messages.append(assistant_payload)
 st.rerun()
