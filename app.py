@@ -1,6 +1,8 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (pubblico con citazioni + guardrail)
-# ✅ Risposte SOLO dal CCNL
-# ✅ Pubblico: include SEMPRE citazioni (pagine)
+# app.py — Assistente Contrattuale UILCOM IPZS (CCNL + Indice IPZS Permessi)
+# ✅ Risposte SOLO dai documenti caricati:
+#    - CCNL (PDF)
+#    - IPZS Permessi (TXT da screenshot)
+# ✅ Pubblico: include SEMPRE citazioni (pagine/schede)
 # ✅ Admin: debug + evidenze + chunk/pagine usate
 # ✅ Topic reset: se cambia argomento, NON usa memoria breve (evita contaminazioni)
 # ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
@@ -31,15 +33,28 @@ except Exception:
 # CONFIG
 # ============================================================
 APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
-PDF_PATH = os.path.join("documenti", "ccnl.pdf")
 
+# CCNL
+PDF_PATH = os.path.join("documenti", "ccnl.pdf")
 INDEX_DIR = "index_ccnl"
 VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
 META_PATH = os.path.join(INDEX_DIR, "chunks.json")
 
+# IPZS Permessi (TXT da screenshot)
+# 👉 metti in /documenti/ questo file: PERMESSI_IPZS_COMPLETO_FINALE.txt
+IPZS_TXT_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
+INDEX_DIR_IPZS = "index_ipzs_permessi"
+VEC_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "vectors.npy")
+META_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "chunks.json")
+
+# Chunking
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 
+IPZS_CHUNK_SIZE = 1000
+IPZS_CHUNK_OVERLAP = 120
+
+# Retrieval
 TOP_K_PER_QUERY = 12
 TOP_K_FINAL = 18
 MAX_MULTI_QUERIES = 12
@@ -89,9 +104,10 @@ st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout
 st.title(APP_TITLE)
 st.markdown(
     "**Accesso riservato agli iscritti UILCOM**  \n"
-    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** e norme applicabili ai lavoratori IPZS.  \n\n"
-    "⚠️ Le risposte sono generate **solo** in base al CCNL caricato. "
-    "Le citazioni (pagine) sono incluse per permettere la verifica diretta. "
+    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** "
+    "e delle **schede permessi IPZS** (da screenshot).  \n\n"
+    "⚠️ Le risposte sono generate **solo** in base ai documenti caricati. "
+    "Le citazioni (pagine/schede) sono incluse per permettere la verifica diretta. "
     "Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
 )
 st.divider()
@@ -115,8 +131,6 @@ if UILCOM_PASSWORD:
                 st.error("Password non corretta.")
 else:
     st.warning("Password iscritti non impostata. Imposta UILCOM_PASSWORD in Secrets (Streamlit) o variabile d’ambiente.")
-    # Per sviluppo locale puoi forzare qui:
-    # st.session_state.auth_ok = True
 
 if not st.session_state.auth_ok:
     st.stop()
@@ -127,84 +141,6 @@ if not st.session_state.auth_ok:
 # ============================================================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
-
-with st.sidebar:
-    st.header("⚙️ Controlli")
-
-    # Admin login
-    st.subheader("🧠 Admin (debug)")
-    if ADMIN_PASSWORD:
-        admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("Login admin", use_container_width=True):
-                if admin_in == ADMIN_PASSWORD:
-                    st.session_state.is_admin = True
-                    st.success("Admin attivo.")
-                else:
-                    st.session_state.is_admin = False
-                    st.error("Password admin errata.")
-        with c2:
-            if st.button("Logout", use_container_width=True):
-                st.session_state.is_admin = False
-    else:
-        st.caption("ADMIN_PASSWORD non impostata (Secrets).")
-
-    st.divider()
-
-    # Index management
-    st.subheader("📦 Indice CCNL")
-    ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
-    st.write("Indice presente:", "✅" if ok_index else "❌")
-
-    if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
-        # Rebuild
-        try:
-            with st.spinner("Indicizzazione in corso..."):
-                if not os.path.exists(PDF_PATH):
-                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
-
-                os.makedirs(INDEX_DIR, exist_ok=True)
-
-                loader = PyPDFLoader(PDF_PATH)
-                docs = loader.load()
-
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
-                )
-                chunks = splitter.split_documents(docs)
-
-                texts = [c.page_content for c in chunks]
-                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based
-
-                # Embeddings
-                if not OPENAI_API_KEY:
-                    raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
-
-                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors = emb.embed_documents(texts)
-                vectors = np.array(vectors, dtype=np.float32)
-
-                np.save(VEC_PATH, vectors)
-                with open(META_PATH, "w", encoding="utf-8") as f:
-                    json.dump(
-                        [{"page": p, "text": t} for p, t in zip(pages, texts)],
-                        f,
-                        ensure_ascii=False,
-                    )
-
-            st.success(f"Indicizzazione completata. Chunk: {len(chunks)}")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
-
-    if st.button("🧹 Nuova chat", use_container_width=True):
-        st.session_state.messages = []
-        st.session_state.last_topic = None
-        st.rerun()
-
-    st.divider()
-    st.caption("Suggerimento: dopo modifiche a app.py su GitHub, Streamlit Cloud fa auto-redeploy. Se no: **Reboot app**.")
 
 
 # ============================================================
@@ -231,12 +167,12 @@ def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     return mat_norm @ q
 
 
-def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-    vectors = np.load(VEC_PATH)
-    with open(META_PATH, "r", encoding="utf-8") as f:
+def load_index(vec_path: str, meta_path: str) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    vectors = np.load(vec_path)
+    with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    fixed = []
+    fixed: List[Dict[str, Any]] = []
     for item in meta:
         if isinstance(item, dict) and "text" in item and "page" in item:
             fixed.append({"page": item.get("page", "?"), "text": item.get("text", "")})
@@ -261,10 +197,17 @@ def unique_pages(chunks: List[Dict[str, Any]], max_pages: int = 8) -> List[int]:
     return pages
 
 
-def format_public_citations(pages: List[int]) -> str:
+def format_public_citations(source: str, pages: List[int]) -> str:
     if not pages:
         return ""
     pages_sorted = sorted(pages)
+    # source: "CCNL" o "IPZS"
+    if source == "IPZS":
+        if len(pages_sorted) == 1:
+            return f"**Fonte:** IPZS Permessi (scheda {pages_sorted[0]})"
+        return f"**Fonte:** IPZS Permessi (schede {', '.join(map(str, pages_sorted))})"
+
+    # default CCNL
     if len(pages_sorted) == 1:
         return f"**Fonte:** CCNL (pag. {pages_sorted[0]})"
     return f"**Fonte:** CCNL (pagg. {', '.join(map(str, pages_sorted))})"
@@ -316,56 +259,55 @@ STRAORDINARI_TRIGGERS = [
     "notturno", "festivo", "supplementare"
 ]
 
+
 def is_mansioni_question(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in MANSIONI_TRIGGERS)
+
 
 def is_conservazione_context(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in CONSERVAZIONE_TRIGGERS)
 
+
 def is_permessi_question(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in PERMESSI_TRIGGERS)
+
 
 def is_rol_exfest_question(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in ROL_EXFEST_TRIGGERS)
 
+
 def is_malattia_question(q: str) -> bool:
     ql = q.lower()
     return any(t in ql for t in MALATTIA_TRIGGERS)
+
 
 def is_straordinario_notturno_question(q: str) -> bool:
     ql = q.lower()
     return ("straordin" in ql) and ("notturn" in ql)
 
+
 def is_lavoro_notturno_question(q: str) -> bool:
     ql = q.lower()
-    # lavoro notturno "ordinario": notturno ma NON straordinario
     return ("notturn" in ql) and ("straordin" not in ql)
 
+
 def detect_topic(q: str) -> str:
-    """Topic per evitare che la memoria contamini argomenti diversi."""
     ql = q.lower()
 
-    # PRIORITÀ: domande su malattia devono restare su "malattia"
     if is_malattia_question(ql):
         return "malattia"
-
-    # Mansioni: solo se l’utente parla davvero di mansioni/cambio livello/sostituzione ecc.
     if is_mansioni_question(ql):
         return "mansioni"
-
     if is_rol_exfest_question(ql):
         return "rol_exfest"
-
     if is_permessi_question(ql):
         return "permessi"
-
     if any(t in ql for t in STRAORDINARI_TRIGGERS):
         return "straordinari_notturno_festivo"
-
     return "altro"
 
 
@@ -376,7 +318,6 @@ def build_enriched_question(current_q: str, current_topic: str) -> str:
     if "messages" not in st.session_state:
         return current_q.strip()
 
-    # Se topic diverso dall'ultimo, non usare memoria
     last_topic = st.session_state.get("last_topic", None)
     if last_topic and last_topic != current_topic:
         return current_q.strip()
@@ -403,61 +344,52 @@ def build_queries(q: str) -> List[str]:
     q0 = q.strip()
     qlow = q0.lower()
 
-    qs = [q0, f"{q0} CCNL", f"{q0} regole condizioni", f"{q0} definizione procedura"]
+    qs = [q0, f"{q0} regole condizioni", f"{q0} definizione procedura"]
 
     user_is_rol = is_rol_exfest_question(q0)
     user_is_perm = is_permessi_question(q0)
     user_is_mal = is_malattia_question(q0)
     user_is_mans = is_mansioni_question(q0)
 
-    # ========== ROL / ex festività ==========
     if user_is_rol:
         qs += [
+            "RAO festività infrasettimanali abolite riposi retribuiti",
             "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
+            "riposo retribuito art.31 tre turni 24 ore 24",
             "festività soppresse abolite riposi retribuiti quanti giorni",
-            "festività infrasettimanali abolite riposi retribuiti",
-            "riposi retribuiti in sostituzione delle festività abolite",
         ]
 
-    # ========== Permessi generici ==========
     if user_is_perm and (not user_is_rol):
         qs += [
-            "permessi retribuiti tipologie CCNL elenco completo",
-            "assenze retribuite tipologie visite mediche lutto matrimonio 104 sindacali studio donazione sangue",
-            "permessi sindacali assemblea ore retribuite",
-            "diritto allo studio 150 ore triennio permessi retribuiti",
-            "ROL riduzione orario di lavoro riposi retribuiti",
-            "festività soppresse abolite riposi retribuiti",
+            "permessi retribuiti tipologie elenco",
+            "permesso non retribuito una settimana l'anno",
+            "permesso studio una settimana l'anno",
+            "donazione sangue permesso giornaliero retribuito",
+            "permessi elettorali presidente seggio scrutatore",
+            "congedo obbligatorio padre 10 giorni",
+            "legge 104 art 33 comma 3 permesso disabili grave",
         ]
 
-    # ========== Malattia ==========
     if user_is_mal:
         qs += [
-            "malattia trattamento economico percentuali integrazione INPS CCNL",
-            "malattia retribuzione primi giorni carenza integrazione azienda",
-            "malattia periodo di comporto durata conservazione posto",
+            "malattia trattamento economico percentuali integrazione",
+            "malattia periodo di comporto conservazione posto",
             "malattia visite fiscali reperibilità fasce orarie",
-            "malattia ricovero ospedaliero trattamento economico",
         ]
 
-    # ========== Straordinari / notturno ==========
     if any(t in qlow for t in STRAORDINARI_TRIGGERS):
         qs += [
             "lavoro straordinario maggiorazioni limiti",
             "straordinario notturno maggiorazione percentuale",
             "lavoro notturno maggiorazione percentuale",
-            "notturno ordinario trattamento economico",
             "lavoro festivo maggiorazioni",
         ]
 
-    # ========== Mansioni superiori ==========
     if user_is_mans:
         qs += [
-            "mansioni superiori regole generali posto vacante",
             "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
             "assegnazione a mansioni superiori trattamento corrispondente",
-            "non si applica in caso di sostituzione di dipendente assente con diritto alla conservazione del posto",
-            "inquadramento superiore effetti",
+            "sostituzione lavoratore assente diritto conservazione del posto",
         ]
 
     out, seen = [], set()
@@ -473,12 +405,16 @@ def build_queries(q: str) -> List[str]:
 # ============================================================
 # EVIDENCE EXTRACTION (robusta)
 # ============================================================
-def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
+def extract_key_evidence(chunks: List[Dict[str, Any]], source: str) -> List[str]:
     patterns = [
         r"\b30\b", r"\b60\b", r"%", r"tre\s+mesi", r"\b3\s+mesi\b",
         r"posto\s+vacante", r"mansioni?\s+superiori?", r"sostituzion",
         r"conservazion.*posto", r"diritto.*conservazion.*posto",
         r"trattamento\s+corrispondente", r"retribuzion",
+        r"donazione\s+sangue", r"permesso\s+non\s+retribuito",
+        r"permesso\s+studio", r"permessi\s+elettorali", r"\b104\b",
+        r"\brao\b", r"\brol\b", r"riduzione\s+orario",
+        r"riposo\s+retribuit", r"art\.?\s*31",
     ]
 
     evidences: List[str] = []
@@ -491,7 +427,8 @@ def extract_key_evidence(chunks: List[Dict[str, Any]]) -> List[str]:
             if any(re.search(p, ln_low) for p in patterns):
                 ln_clean = " ".join(ln.split())
                 if 20 <= len(ln_clean) <= 420:
-                    evidences.append(f"(pag. {page}) {ln_clean}")
+                    tag = "scheda" if source == "IPZS" else "pag."
+                    evidences.append(f"({tag} {page}) {ln_clean}")
 
     out, seen = [], set()
     for e in evidences:
@@ -528,6 +465,7 @@ def _find_snippets(patterns: List[str], chunks: List[Dict[str, Any]], max_hits: 
                 break
     return hits
 
+
 def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     patt_30 = [r"\b30\b.*giorn", r"trenta.*giorn"]
     patt_60 = [r"\b60\b.*giorn", r"sessanta.*giorn"]
@@ -541,12 +479,8 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
     found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
 
-    found_30_consec = (re.search(r"\b30\b", txt_all) is not None) and (re.search(r"consecutiv|continuativ", txt_all) is not None)
-    found_60_nonconsec = (re.search(r"\b60\b", txt_all) is not None) and (re.search(r"non\s+consecutiv|discontinu|non\s+continuativ", txt_all) is not None)
-
     has_trattamento = re.search(r"trattamento\s+corrispondente|diritto\s+al\s+trattamento|retribuzion.*corrispond", txt_all) is not None
     has_esclusione = re.search(r"sostituzion.*conservazion|diritto.*conservazion.*posto|non\s+.*applica", txt_all) is not None
-    has_3_mesi = re.search(r"tre\s+mesi|\b3\s+mesi\b", txt_all) is not None
 
     snip_30 = _find_snippets(patt_30 + patt_consec, chunks)
     snip_60 = _find_snippets(patt_60 + patt_non_consec, chunks)
@@ -564,17 +498,15 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "found_30": found_30,
         "found_60": found_60,
-        "found_30_consec": found_30_consec,
-        "found_60_nonconsec": found_60_nonconsec,
         "has_trattamento": has_trattamento,
         "has_esclusione": has_esclusione,
-        "has_3_mesi": has_3_mesi,
         "snip_30": snip_30,
         "snip_60": snip_60,
         "snip_tratt": snip_tratt,
         "snip_escl": snip_escl,
         "pages": sorted([p for p in pages if p]),
     }
+
 
 def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     ql = user_q.lower()
@@ -602,7 +534,7 @@ def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     m = re.search(r"\b(\d{1,3})\s+giorn", ql)
     if m:
         gg = int(m.group(1))
-        if gg <= 10 and diff_paga:
+        if gg <= 15 and diff_paga:
             parts.append(
                 f"Quindi, se parli di **{gg} giorni**, in base al CCNL hai diritto alla **retribuzione corrispondente** per quei giorni; "
                 "la **stabilizzazione** (passaggio definitivo) richiede invece le soglie indicate (30/60) se previste nel CCNL."
@@ -616,21 +548,21 @@ def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
         else:
             parts.append("Non ho trovato la risposta nel CCNL caricato (nel materiale recuperato).")
 
-    # Citazioni pubbliche
     pages = rules.get("pages", []) or []
-    cit = format_public_citations([p for p in pages if isinstance(p, int)])
+    cit = format_public_citations("CCNL", [p for p in pages if isinstance(p, int)])
     if cit:
         parts.append(cit)
 
     return "\n\n".join(parts).strip()
+
 
 def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
     lines = []
     lines.append(f"- found_30: {rules.get('found_30')}, found_60: {rules.get('found_60')}")
     lines.append(f"- has_trattamento: {rules.get('has_trattamento')}")
     lines.append(f"- has_esclusione: {rules.get('has_esclusione')}")
-    lines.append(f"- has_3_mesi: {rules.get('has_3_mesi')} (IGNORATO se 30/60 presenti)")
     lines.append(f"- pages: {rules.get('pages')}")
+
     def fmt(snips: List[Dict[str, Any]], title: str):
         if not snips:
             lines.append(f"- {title}: (nessuno)")
@@ -638,8 +570,9 @@ def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
         lines.append(f"- {title}:")
         for s in snips[:4]:
             p = s.get("page", "?")
-            t = " ".join((s.get("text","") or "").split())
+            t = " ".join((s.get("text", "") or "").split())
             lines.append(f"  • (pag. {p}) {t[:240]}{'...' if len(t)>240 else ''}")
+
     fmt(rules.get("snip_tratt", []), "Evidenze trattamento corrispondente")
     fmt(rules.get("snip_30", []), "Evidenze 30 giorni")
     fmt(rules.get("snip_60", []), "Evidenze 60 giorni")
@@ -652,23 +585,24 @@ def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
 # ============================================================
 RULES = """
 Sei l’assistente UILCOM per lavoratori IPZS.
-Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto (estratti CCNL) fornito.
+Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto fornito (estratti dai documenti indicizzati).
 Non inventare informazioni.
 
 REGOLE IMPORTANTI:
-1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nel CCNL caricato."
+1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nei documenti caricati."
 2) NON confondere lavoro notturno con straordinario notturno:
    - Se la domanda è "lavoro notturno" (ordinario), usa solo regole/percentuali del notturno ordinario.
    - Se nel contesto trovi solo "straordinario notturno", devi dirlo e NON applicarlo al notturno ordinario.
 3) TERMINOLOGIA EX FESTIVITÀ:
-   - Se l’utente dice "ex festività" ma nel CCNL trovi "festività soppresse/abolite/infrasettimanali abolite",
-     spiega che nel CCNL la dicitura è quella (equivalente all’uso comune).
+   - Se l’utente dice "ex festività" ma nel testo trovi "festività soppresse/abolite/infrasettimanali abolite",
+     spiega che la dicitura è quella (equivalente all’uso comune).
 4) Permessi:
    - Elenca SOLO le tipologie che trovi nel contesto.
-5) PUBBLICO: devi SEMPRE includere una riga finale "Fonte: CCNL (pag. X...)" con le pagine usate.
+5) PUBBLICO: devi SEMPRE includere una riga finale con la fonte:
+   - "Fonte: CCNL (pag. ...)" oppure "Fonte: IPZS Permessi (scheda ...)".
 6) MALATTIA:
    - Se la domanda riguarda la malattia, includi se presenti nel contesto:
-     • trattamento economico (percentuali o integrazione)
+     • trattamento economico
      • periodo di comporto
      • eventuali regole di reperibilità/visite fiscali
    - Se alcune informazioni non sono nel contesto recuperato, non inventarle.
@@ -677,7 +611,7 @@ FORMATO OUTPUT OBBLIGATORIO:
 
 <PUBLIC>
 ...testo per l’utente...
-(Fonte: CCNL (pag. ...))
+(Fonte: ... )
 </PUBLIC>
 
 <ADMIN>
@@ -688,6 +622,167 @@ FORMATO OUTPUT OBBLIGATORIO:
 
 
 # ============================================================
+# IPZS TXT SPLIT (schede)
+# ============================================================
+def split_ipzs_blocks(raw_txt: str) -> List[str]:
+    txt = raw_txt.replace("\r\n", "\n")
+    lines = txt.split("\n")
+
+    starts = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+
+        # Titolo “tipo schermata”: tutto maiuscolo + numeri / simboli comuni
+        is_title = (
+            len(s) >= 4 and len(s) <= 80
+            and re.fullmatch(r"[A-Z0-9\.\-\/\(\)\s]+", s) is not None
+        )
+
+        if is_title:
+            starts.append(i)
+
+    if len(starts) >= 2:
+        blocks = []
+        for k in range(len(starts)):
+            a = starts[k]
+            b = starts[k + 1] if k + 1 < len(starts) else len(lines)
+            block = "\n".join(lines[a:b]).strip()
+            if len(block) >= 80:
+                blocks.append(block)
+        if blocks:
+            return blocks
+
+    return [txt.strip()]
+
+
+# ============================================================
+# SIDEBAR: CONTROLLI + INDICI + PULSANTI
+# ============================================================
+with st.sidebar:
+    st.header("⚙️ Controlli")
+
+    # Admin login
+    st.subheader("🧠 Admin (debug)")
+    if ADMIN_PASSWORD:
+        admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Login admin", use_container_width=True):
+                if admin_in == ADMIN_PASSWORD:
+                    st.session_state.is_admin = True
+                    st.success("Admin attivo.")
+                else:
+                    st.session_state.is_admin = False
+                    st.error("Password admin errata.")
+        with c2:
+            if st.button("Logout", use_container_width=True):
+                st.session_state.is_admin = False
+    else:
+        st.caption("ADMIN_PASSWORD non impostata (Secrets).")
+
+    st.divider()
+
+    # Index CCNL
+    st.subheader("📦 Indice CCNL")
+    ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
+    st.write("Indice presente:", "✅" if ok_index else "❌")
+
+    if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
+        try:
+            with st.spinner("Indicizzazione CCNL in corso..."):
+                if not os.path.exists(PDF_PATH):
+                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
+
+                os.makedirs(INDEX_DIR, exist_ok=True)
+
+                loader = PyPDFLoader(PDF_PATH)
+                docs = loader.load()
+
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+                )
+                chunks = splitter.split_documents(docs)
+
+                texts = [c.page_content for c in chunks]
+                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]  # pagine 1-based
+
+                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                vectors = emb.embed_documents(texts)
+                vectors = np.array(vectors, dtype=np.float32)
+
+                np.save(VEC_PATH, vectors)
+                with open(META_PATH, "w", encoding="utf-8") as f:
+                    json.dump(
+                        [{"page": p, "text": t} for p, t in zip(pages, texts)],
+                        f,
+                        ensure_ascii=False,
+                    )
+
+            st.success(f"Indicizzazione CCNL completata. Chunk: {len(chunks)}")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    st.divider()
+
+    # Index IPZS (permessi)
+    st.subheader("📦 Indice IPZS (permessi)")
+    ok_ipzs = os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)
+    st.write("Indice IPZS presente:", "✅" if ok_ipzs else "❌")
+
+    if st.button("Indicizza / Reindicizza IPZS (permessi)", use_container_width=True):
+        try:
+            with st.spinner("Indicizzazione IPZS in corso..."):
+                if not os.path.exists(IPZS_TXT_PATH):
+                    raise FileNotFoundError(f"Non trovo il file: {IPZS_TXT_PATH} (metti il TXT in /documenti)")
+
+                os.makedirs(INDEX_DIR_IPZS, exist_ok=True)
+
+                with open(IPZS_TXT_PATH, "r", encoding="utf-8") as f:
+                    raw_txt = f.read()
+
+                blocks = split_ipzs_blocks(raw_txt)
+
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=IPZS_CHUNK_SIZE,
+                    chunk_overlap=IPZS_CHUNK_OVERLAP
+                )
+
+                chunks: List[Dict[str, Any]] = []
+                scheda = 0
+
+                for b in blocks:
+                    scheda += 1
+                    parts = splitter.split_text(b)
+                    for p in parts:
+                        chunks.append({"page": scheda, "text": p})
+
+                texts = [c["text"] for c in chunks]
+                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                vectors_ipzs = np.array(emb.embed_documents(texts), dtype=np.float32)
+
+                np.save(VEC_PATH_IPZS, vectors_ipzs)
+                with open(META_PATH_IPZS, "w", encoding="utf-8") as f:
+                    json.dump(chunks, f, ensure_ascii=False)
+
+            st.success(f"Indicizzazione IPZS completata. Schede: {len(blocks)} — Chunk: {len(chunks)}")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    st.divider()
+
+    if st.button("🧹 Nuova chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.last_topic = None
+        st.rerun()
+
+    st.caption("Dopo modifiche a app.py su GitHub: Streamlit Cloud fa auto-redeploy. Se no: **Reboot app**.")
+
+
+# ============================================================
 # CHAT STATE
 # ============================================================
 if "messages" not in st.session_state:
@@ -695,7 +790,7 @@ if "messages" not in st.session_state:
 if "last_topic" not in st.session_state:
     st.session_state.last_topic = None
 
-# Render chat
+# Render chat history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
@@ -703,6 +798,7 @@ for m in st.session_state.messages:
             dbg = m.get("debug", None)
             if dbg:
                 with st.expander("🧠 Admin: Query / Evidenze / Chunk (debug)", expanded=False):
+                    st.write("**Sorgente:**", dbg.get("source", ""))
                     st.write("**Topic:**", dbg.get("topic", ""))
                     st.write("**Domanda arricchita (memoria breve):**")
                     st.code(dbg.get("enriched_q", ""))
@@ -716,37 +812,53 @@ for m in st.session_state.messages:
                         st.code(dbg.get("mansioni_guardrail"))
                     st.write("**Chunk selezionati (prime righe):**")
                     for c in dbg.get("selected", []):
-                        st.write(f"**Pagina {c.get('page')}**")
+                        label = "Scheda" if dbg.get("source") == "IPZS" else "Pagina"
+                        st.write(f"**{label} {c.get('page')}**")
                         txt = (c.get("text") or "")
                         st.write(txt[:800] + ("..." if len(txt) > 800 else ""))
                         st.divider()
 
 
-user_input = st.chat_input("Scrivi una domanda sul CCNL (permessi, ROL/festività soppresse, malattia, straordinari, categorie...)")
-
+user_input = st.chat_input("Scrivi una domanda (permessi, ROL/RAO, malattia, straordinari, mansioni superiori...)")
 if not user_input:
     st.stop()
-
-# Require index
-if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
-    st.session_state.messages.append({"role": "user", "content": user_input})
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": "Prima devo indicizzare il CCNL: apri la barra laterale e clicca **Indicizza / Reindicizza CCNL**.",
-    })
-    st.rerun()
 
 # Append user msg
 st.session_state.messages.append({"role": "user", "content": user_input})
 
-
 # ============================================================
-# RETRIEVAL PIPELINE (con topic reset)
+# SCEGLI SORGENTE: CCNL o IPZS (permessi/ROL/RAO)
 # ============================================================
 topic = detect_topic(user_input)
 enriched_q = build_enriched_question(user_input, topic)
 
-vectors, meta = load_index()
+use_ipzs = topic in ("permessi", "rol_exfest")
+source = "IPZS" if use_ipzs else "CCNL"
+
+# Controllo indice richiesto
+if source == "CCNL":
+    if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "Prima devo indicizzare il CCNL: apri la barra laterale e clicca **Indicizza / Reindicizza CCNL**.",
+        })
+        st.rerun()
+else:
+    if not (os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)):
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "Prima devo indicizzare le **schede IPZS (permessi)**: apri la barra laterale e clicca **Indicizza / Reindicizza IPZS (permessi)**.",
+        })
+        st.rerun()
+
+# ============================================================
+# RETRIEVAL PIPELINE (con topic reset)
+# ============================================================
+if source == "CCNL":
+    vectors, meta = load_index(VEC_PATH, META_PATH)
+else:
+    vectors, meta = load_index(VEC_PATH_IPZS, META_PATH_IPZS)
+
 mat_norm = normalize_rows(vectors)
 emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
@@ -770,29 +882,33 @@ for q in queries:
 final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
 selected = [meta[i] for i in final_idx]
 
-# Optional BM25 rerank for final precision
+# Optional BM25 rerank
 selected = bm25_rerank(enriched_q, selected)
 
-# Evidence
-key_evidence = extract_key_evidence(selected)
-
-# Paginate citations (public)
+# Evidence + citations
+key_evidence = extract_key_evidence(selected, source)
 public_pages = unique_pages(selected, max_pages=8)
-public_cit_line = format_public_citations(public_pages)
+public_cit_line = format_public_citations(source, public_pages)
 
-# HARD guardrail retrieval: se debole -> non rispondere
+# Hard guardrail retrieval
 retrieval_ok = (best_similarity >= MIN_BEST_SIMILARITY) and (len(selected) >= MIN_SELECTED_CHUNKS)
 
 def hard_not_found_message() -> str:
-    msg = "Non ho trovato la risposta nel CCNL caricato."
-    # in modalità pubblica, se non troviamo bene, NON inventiamo pagine
-    return msg
+    return "Non ho trovato la risposta nei documenti caricati."
+
 
 # ============================================================
-# ⭐ HARD GUARDRAIL MANSIONI: risposta deterministica (stop LLM)
+# ⭐ HARD GUARDRAIL MANSIONI: SOLO SU CCNL + deterministico
 # ============================================================
-user_is_mans = (topic == "mansioni")
-if user_is_mans:
+if topic == "mansioni":
+    # Forza CCNL (le mansioni non stanno nelle schede permessi)
+    if source != "CCNL":
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": "Questa domanda riguarda **mansioni superiori**: la tratto sul **CCNL**. Indicizza il CCNL e riprova.",
+        })
+        st.rerun()
+
     if not retrieval_ok:
         public_ans = hard_not_found_message()
     else:
@@ -800,16 +916,16 @@ if user_is_mans:
         public_ans = mansioni_public_answer(user_input, rules_m)
 
     assistant_payload: Dict[str, Any] = {"role": "assistant", "content": public_ans}
-
     if st.session_state.is_admin:
         assistant_payload["debug"] = {
+            "source": source,
             "topic": topic,
             "enriched_q": enriched_q,
             "queries": queries,
             "evidence": key_evidence,
             "selected": selected,
             "best_similarity": best_similarity,
-            "mansioni_guardrail": mansioni_admin_debug(extract_mansioni_rules(selected)) if retrieval_ok else "(retrieval debole: guardrail non applicato)",
+            "mansioni_guardrail": mansioni_admin_debug(extract_mansioni_rules(selected)) if retrieval_ok else "(retrieval debole)",
             "bm25_available": BM25_AVAILABLE,
         }
 
@@ -825,6 +941,7 @@ if not retrieval_ok:
     assistant_payload: Dict[str, Any] = {"role": "assistant", "content": hard_not_found_message()}
     if st.session_state.is_admin:
         assistant_payload["debug"] = {
+            "source": source,
             "topic": topic,
             "enriched_q": enriched_q,
             "queries": queries,
@@ -838,7 +955,7 @@ if not retrieval_ok:
     st.session_state.messages.append(assistant_payload)
     st.rerun()
 
-context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
+context = "\n\n---\n\n".join([f"[{'Scheda' if source=='IPZS' else 'Pagina'} {c.get('page','?')}] {c.get('text','')}" for c in selected])
 evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
 
 guardrail_notturno = ""
@@ -856,6 +973,7 @@ llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_AP
 prompt = f"""
 {RULES}
 
+SORGENTE ATTIVA: {source}
 {guardrail_notturno}
 
 DOMANDA (UTENTE):
@@ -867,12 +985,14 @@ DOMANDA ARRICCHITA (MEMORIA BREVE - solo stesso topic):
 EVIDENZE (se presenti, sono operative):
 {evidence_block}
 
-CONTESTO CCNL (estratti):
+CONTESTO (estratti indicizzati):
 {context}
 
 RICORDA:
-- Nel PUBLIC: risposta pulita MA con citazione finale "Fonte: CCNL (pag. ...)".
-- Nel ADMIN: inserisci elenco pagine trovate e 5-10 righe evidenza importanti con (pag. X).
+- Nel PUBLIC: risposta pulita MA con citazione finale coerente con la sorgente:
+  • CCNL -> "Fonte: CCNL (pag. ...)"
+  • IPZS -> "Fonte: IPZS Permessi (scheda ...)"
+- Nel ADMIN: inserisci elenco pagine/schede trovate e righe evidenza importanti con (pag./scheda X).
 """
 
 def split_public_admin(text: str) -> Tuple[str, str]:
@@ -911,6 +1031,7 @@ assistant_payload: Dict[str, Any] = {
 
 if st.session_state.is_admin:
     assistant_payload["debug"] = {
+        "source": source,
         "topic": topic,
         "enriched_q": enriched_q,
         "queries": queries,
@@ -924,6 +1045,3 @@ if st.session_state.is_admin:
 st.session_state.last_topic = topic
 st.session_state.messages.append(assistant_payload)
 st.rerun()
-
-
-
