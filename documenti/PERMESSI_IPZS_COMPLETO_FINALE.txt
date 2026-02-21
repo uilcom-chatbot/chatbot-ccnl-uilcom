@@ -110,24 +110,29 @@ Mensilmente viene caricata la spettanza equivalente a un rateo. E' possibile ric
 
 
 CONG.STRAO.DL.151/01ART42
+-------------------------
 Descrizione:
 Congedo retribuito per i lavoratori che prestano assistenza del convivente, coniuge, parenti o affini entro il terzo grado con disabilità grave ai sensi della legge 104/1992 art 3, comma 3 per un massimo di 2 anni nell'arco della vita lavorativa . Allegare domanda e ricevuta INPS. E' obbligatorio inserire il codice fiscale del familiare.
 
 CURE TERMALI
+------------
 Descrizione:
 Congedo retribuito per cure termali per un massimo di 15 giorni annui non frazionabili. Allegare la prescrizione specialista ASL ovvero INAIL o INPS in ottemperanza alla vigente norma di legge ( cure presenti nel DPCM 12/01/2017 ) nel caso in cui sia necessario il tempestivo trattamento termale, con l’indicazione di un termine per l’inizio della terapia non superiore a 30 giorni e il modello di richiesta interno. Il permesso è da richiedere, tassativamente, almeno 7 giorni prima.
 Entro tre giorni dall'avvenute cure termali inviare a giustificativipresenze@ipzs.it la certificazione dello Stabilimento/Struttura attestante l’avvenuta effettuazione delle cure prescritte.
 Tra il periodo di cure e le ferie annuali deve intercorrere un intervallo di almeno 15 giorni.
 
 L.53/00 ART.4 C.4 DECESSO
+-------------------------
 Descrizione:
 Congedo retribuito per i lavoratori ai sensi della legge 53/2000 in caso di decesso di un parente entro il secondo grado o del convivente da fruire entro 7 giorni lavorativi dalla data del decesso per un massimo di tre giorni annui. Allegare certificato di decesso e l'autocertificazione del grado di parentela, nel caso del convivente allegare certificazione anagrafica attestante la convivenza.
 
 INSERIM.NIDO GG(ACC.NIDO)
+-------------------------
 Descrizione:
 Permesso retribuito per favorire l’inserimento al nido dei propri figli per un massimo di 5 giorni lavorativi. Di tale permesso si potrà usufruire sola una volta per tutta la frequenza del nido. Allegare certificato di iscrizione del nido e il bollettino di pagamento I° mensilità. Al termine del permesso retribuito inviare a giustificativipresenze@ipzs.it il certificato di avvenuto inserimento nido. La richiesta deve essere presentata al datore di lavoro 3 giorni prima della fruizione dello stesso.
 
 L.53/00 ART.4 C.4
+-----------------
 Descrizione:
 Congedo retribuito per i lavoratori che prestano assistenza in caso di documentata grave infermità del coniuge o di un parente entro il secondo grado o del convivente per un massimo di tre giorni annui. Allegare certificato medico attestante la grave infermità con specifico riferimento all'art 4 della legge 53/2000 e contenente i nominativi di chi presta e chi riceva assistenza, autocertificazione del grado di parentela, nel caso del convivente allegare certificazione anagrafica attestante la convivenza.
 
