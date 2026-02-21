@@ -409,7 +409,6 @@ def build_queries(q: str) -> List[str]:
     user_is_perm = is_permessi_question(q0)
     user_is_mal = is_malattia_question(q0)
     user_is_mans = is_mansioni_question(q0)
-    user_is_conserv = is_conservazione_context(q0)
 
     # ========== ROL / ex festività ==========
     if user_is_rol:
@@ -431,15 +430,15 @@ def build_queries(q: str) -> List[str]:
             "festività soppresse abolite riposi retribuiti",
         ]
 
-   # ========== Malattia ==========
-if user_is_mal:
-    qs += [
-        "malattia trattamento economico percentuali integrazione INPS CCNL",
-        "malattia retribuzione primi giorni carenza integrazione azienda",
-        "malattia periodo di comporto durata conservazione posto",
-        "malattia visite fiscali reperibilità fasce orarie",
-        "malattia ricovero ospedaliero trattamento economico",
-    ]
+    # ========== Malattia ==========
+    if user_is_mal:
+        qs += [
+            "malattia trattamento economico percentuali integrazione INPS CCNL",
+            "malattia retribuzione primi giorni carenza integrazione azienda",
+            "malattia periodo di comporto durata conservazione posto",
+            "malattia visite fiscali reperibilità fasce orarie",
+            "malattia ricovero ospedaliero trattamento economico",
+        ]
 
     # ========== Straordinari / notturno ==========
     if any(t in qlow for t in STRAORDINARI_TRIGGERS):
@@ -451,8 +450,8 @@ if user_is_mal:
             "lavoro festivo maggiorazioni",
         ]
 
-    # ========== Mansioni superiori / categoria ==========
-    if user_is_mans or user_is_conserv:
+    # ========== Mansioni superiori ==========
+    if user_is_mans:
         qs += [
             "mansioni superiori regole generali posto vacante",
             "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
@@ -467,6 +466,7 @@ if user_is_mal:
         if x and x not in seen:
             out.append(x)
             seen.add(x)
+
     return out[:MAX_MULTI_QUERIES]
 
 
@@ -924,4 +924,5 @@ if st.session_state.is_admin:
 st.session_state.last_topic = topic
 st.session_state.messages.append(assistant_payload)
 st.rerun()
+
 
