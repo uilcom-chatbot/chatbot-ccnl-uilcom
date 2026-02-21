@@ -32,7 +32,12 @@ except Exception:
 # ============================================================
 APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
 PDF_PATH = os.path.join("documenti", "ccnl.pdf")
+# === IPZS (permessi da screenshot) ===
+IPZS_TXT_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
 
+INDEX_DIR_IPZS = "index_ipzs_permessi"
+VEC_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "vectors.npy")
+META_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "chunks.json")
 INDEX_DIR = "index_ccnl"
 VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
 META_PATH = os.path.join(INDEX_DIR, "chunks.json")
@@ -158,6 +163,89 @@ with st.sidebar:
     st.write("Indice presente:", "✅" if ok_index else "❌")
 
     if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
+# ==========================
+# IPZS INDEX management
+# ==========================
+st.subheader("📦 Indice IPZS (permessi)")
+ok_ipzs = os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)
+st.write("Indice IPZS presente:", "✅" if ok_ipzs else "❌")
+
+def split_ipzs_blocks(raw_txt: str) -> List[str]:
+    """
+    Prova a spezzare il TXT in 'schede' usando i TITOLI in maiuscolo tipici.
+    Se non riesce, fallback a chunking classico.
+    """
+    txt = raw_txt.replace("\r\n", "\n")
+    # Split su righe tipo: "DONAZIONE SANGUE", "PERMESSI ELETTORALI", "RAO", "L.53/00 ..." ecc.
+    # Considero "titolo" una riga (quasi) tutta MAIUSCOLA con numeri/punti/slash
+    lines = txt.split("\n")
+    starts = []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s:
+            continue
+        # euristica: molte maiuscole e lunghezza ragionevole
+        is_title = (
+            len(s) >= 4 and len(s) <= 60
+            and re.fullmatch(r"[A-Z0-9\.\-\/\(\)\s]+", s) is not None
+        )
+        if is_title:
+            starts.append(i)
+
+    # Se troviamo almeno 2 titoli, creiamo blocchi
+    if len(starts) >= 2:
+        blocks = []
+        for k in range(len(starts)):
+            a = starts[k]
+            b = starts[k + 1] if k + 1 < len(starts) else len(lines)
+            block = "\n".join(lines[a:b]).strip()
+            if len(block) >= 80:
+                blocks.append(block)
+        if blocks:
+            return blocks
+
+    # fallback: un solo blocco grande
+    return [txt.strip()]
+
+if st.button("Indicizza / Reindicizza IPZS (permessi)", use_container_width=True):
+    try:
+        with st.spinner("Indicizzazione IPZS in corso..."):
+            if not os.path.exists(IPZS_TXT_PATH):
+                raise FileNotFoundError(f"Non trovo il file: {IPZS_TXT_PATH}")
+
+            os.makedirs(INDEX_DIR_IPZS, exist_ok=True)
+
+            with open(IPZS_TXT_PATH, "r", encoding="utf-8") as f:
+                raw_txt = f.read()
+
+            blocks = split_ipzs_blocks(raw_txt)
+
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=120
+            )
+
+            chunks: List[Dict[str, Any]] = []
+            scheda = 0
+            for b in blocks:
+                scheda += 1
+                parts = splitter.split_text(b)
+                for p in parts:
+                    chunks.append({"page": scheda, "text": p})
+
+            texts = [c["text"] for c in chunks]
+
+            emb_local = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+            vectors_ipzs = np.array(emb_local.embed_documents(texts), dtype=np.float32)
+
+            np.save(VEC_PATH_IPZS, vectors_ipzs)
+            with open(META_PATH_IPZS, "w", encoding="utf-8") as f:
+                json.dump(chunks, f, ensure_ascii=False)
+
+        st.success(f"Indicizzazione IPZS completata. Schede: {len(blocks)} | Chunk: {len(chunks)}")
+        st.rerun()
+    except Exception as e:
+        st.error(str(e))
         # Rebuild
         try:
             with st.spinner("Indicizzazione in corso..."):
@@ -231,17 +319,15 @@ def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     return mat_norm @ q
 
 
-def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-    vectors = np.load(VEC_PATH)
-    with open(META_PATH, "r", encoding="utf-8") as f:
+def load_index(vpath: str, mpath: str) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    vectors = np.load(vpath)
+    with open(mpath, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
-    fixed = []
+    fixed: List[Dict[str, Any]] = []
     for item in meta:
         if isinstance(item, dict) and "text" in item and "page" in item:
             fixed.append({"page": item.get("page", "?"), "text": item.get("text", "")})
-        elif isinstance(item, str):
-            fixed.append({"page": "?", "text": item})
         else:
             fixed.append({"page": "?", "text": str(item)})
     return vectors, fixed
@@ -746,7 +832,18 @@ st.session_state.messages.append({"role": "user", "content": user_input})
 topic = detect_topic(user_input)
 enriched_q = build_enriched_question(user_input, topic)
 
-vectors, meta = load_index()
+# ==========================
+# RETRIEVAL: IPZS first (permessi/rol/rao/ferie/congedi) -> fallback CCNL
+# ==========================
+use_ipzs_first = topic in ["permessi", "rol_exfest"]
+
+SOURCE_LABEL = "CCNL"
+vectors, meta = load_index(VEC_PATH, META_PATH)
+
+if use_ipzs_first and os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS):
+    SOURCE_LABEL = "IPZS"
+    vectors, meta = load_index(VEC_PATH_IPZS, META_PATH_IPZS)
+
 mat_norm = normalize_rows(vectors)
 emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
 
@@ -778,11 +875,42 @@ key_evidence = extract_key_evidence(selected)
 
 # Paginate citations (public)
 public_pages = unique_pages(selected, max_pages=8)
-public_cit_line = format_public_citations(public_pages)
+
+if SOURCE_LABEL == "IPZS":
+    if public_pages:
+        public_cit_line = f"**Fonte:** IPZS (schede: {', '.join(map(str, sorted(public_pages)))})"
+    else:
+        public_cit_line = "**Fonte:** IPZS (schede permessi)"
+else:
+    public_cit_line = format_public_citations(public_pages)
 
 # HARD guardrail retrieval: se debole -> non rispondere
 retrieval_ok = (best_similarity >= MIN_BEST_SIMILARITY) and (len(selected) >= MIN_SELECTED_CHUNKS)
+# Fallback: se IPZS non trova abbastanza, riprova sul CCNL
+if (SOURCE_LABEL == "IPZS") and (not retrieval_ok):
+    vectors, meta = load_index(VEC_PATH, META_PATH)
+    mat_norm = normalize_rows(vectors)
+    SOURCE_LABEL = "CCNL"
 
+    # rifai retrieval con le stesse queries
+    scores_best = {}
+    best_similarity = 0.0
+    for q in queries:
+        qvec = np.array(emb.embed_query(q), dtype=np.float32)
+        sims = cosine_scores(qvec, mat_norm)
+        top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
+        for i in top_idx:
+            s = float(sims[int(i)])
+            if s > best_similarity:
+                best_similarity = s
+            scores_best[int(i)] = max(scores_best.get(int(i), -1.0), s)
+
+    final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
+    selected = [meta[i] for i in final_idx]
+    selected = bm25_rerank(enriched_q, selected)
+
+    key_evidence = extract_key_evidence(selected)
+    retrieval_ok = (best_similarity >= MIN_BEST_SIMILARITY) and (len(selected) >= MIN_SELECTED_CHUNKS)
 def hard_not_found_message() -> str:
     msg = "Non ho trovato la risposta nel CCNL caricato."
     # in modalità pubblica, se non troviamo bene, NON inventiamo pagine
@@ -924,5 +1052,6 @@ if st.session_state.is_admin:
 st.session_state.last_topic = topic
 st.session_state.messages.append(assistant_payload)
 st.rerun()
+
 
 
