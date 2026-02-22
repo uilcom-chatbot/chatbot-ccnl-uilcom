@@ -1,9 +1,15 @@
-# app.py — Assistente UILCOM IPZS SUPER UI CHATGPT
+# app.py — Assistente Contrattuale UILCOM IPZS (CCNL + IPZS Permessi)
+# ✅ Chat stile ChatGPT
+# ✅ Risposte CCNL con citazioni pagine
+# ✅ Risposte IPZS Permessi (RAO/ROL ecc) + elenco completo quando richiesto
+# ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
+# ✅ Admin: reindicizza CCNL + Permessi + debug chunk/pagine usate
 
 import os
-import json
 import re
-from typing import List, Dict, Optional
+import json
+import hashlib
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
 import streamlit as st
@@ -12,29 +18,102 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
+# Optional (precision boost): rank-bm25
+try:
+    from rank_bm25 import BM25Okapi  # type: ignore
+    BM25_AVAILABLE = True
+except Exception:
+    BM25_AVAILABLE = False
+
 
 # ============================================================
 # CONFIG
 # ============================================================
-
-APP_TITLE = "Assistente Contrattuale UILCOM IPZS"
+APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
 
 PDF_PATH = os.path.join("documenti", "ccnl.pdf")
 IPZS_PERMESSI_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
-LOGO_PATH = os.path.join("logo", "logo_uilcom.png")
 
-INDEX_DIR = "index_ccnl"
-VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
-META_PATH = os.path.join(INDEX_DIR, "chunks.json")
+# Logo (opzionale)
+LOGO_PATH_1 = os.path.join("logo", "logo_uilcom.png")   # consigliato
+LOGO_PATH_2 = "logo_uilcom.png"                         # fallback se lo metti in root
 
+# Indici
+INDEX_CCNL_DIR = "index_ccnl"
+CCNL_VEC_PATH = os.path.join(INDEX_CCNL_DIR, "vectors.npy")
+CCNL_META_PATH = os.path.join(INDEX_CCNL_DIR, "chunks.json")
+
+INDEX_IPZS_DIR = "index_ipzs_permessi"
+IPZS_VEC_PATH = os.path.join(INDEX_IPZS_DIR, "vectors.npy")
+IPZS_META_PATH = os.path.join(INDEX_IPZS_DIR, "chunks.json")
+
+# Chunking
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
 
+TOP_K_PER_QUERY = 12
+TOP_K_FINAL = 18
+MAX_MULTI_QUERIES = 10
+
+# Guardrail retrieval
+MIN_BEST_SIMILARITY = 0.24
+MIN_SELECTED_CHUNKS = 3
+
+# Admin
+MAX_EVIDENCE_LINES = 18
+
+# LLM
 LLM_MODEL = "gpt-4o-mini"
 LLM_TEMPERATURE = 0
 
 
 # ============================================================
+# SECRETS
+# ============================================================
+def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        if key in st.secrets:  # type: ignore
+            return str(st.secrets[key])  # type: ignore
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
+
+
+# ============================================================
+# UI SETUP
+# ============================================================
+st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
+
+# Logo (non deve mai rompere l'app)
+logo_to_use = LOGO_PATH_1 if os.path.exists(LOGO_PATH_1) else (LOGO_PATH_2 if os.path.exists(LOGO_PATH_2) else None)
+if logo_to_use:
+    try:
+        st.image(logo_to_use, width=140)
+    except Exception:
+        pass
+
+st.title(APP_TITLE)
+st.markdown(
+    "**Accesso riservato agli iscritti UILCOM**  \n"
+    "Strumento informativo per facilitare la consultazione del **CCNL** e del documento **IPZS Permessi/Giustificativi**.  \n\n"
+    "⚠️ Le risposte sono generate **solo** in base ai documenti caricati. "
+    "Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
+)
+st.divider()
+
+
+# ============================================================
+# AUTH: ISCRITTI
+# ============================================================
+if "auth_ok" not in st.session_state:
+    st# ============================================================
 # STREAMLIT STYLE CHATGPT
 # ============================================================
 
@@ -1448,4 +1527,5 @@ if st.session_state.is_admin:
 st.session_state.last_topic = topic
 st.session_state.messages.append(payload)
 st.rerun()
+
 
