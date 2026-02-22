@@ -1,14 +1,15 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (CCNL + IPZS Permessi)
-# ✅ Chat stile ChatGPT
-# ✅ Risposte CCNL con citazioni pagine
-# ✅ Risposte IPZS Permessi (RAO/ROL ecc) + elenco completo quando richiesto
-# ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
-# ✅ Admin: reindicizza CCNL + Permessi + debug chunk/pagine usate
+# app.py — Assistente Contrattuale UILCOM IPZS (CCNL + Documento IPZS Permessi)
+# ✅ Risposte SOLO da documenti indicizzati (CCNL PDF + IPZS TXT) + Memoria UILCOM (solo validata admin)
+# ✅ Elenco COMPLETO permessi quando richiesto
+# ✅ Permesso specifico -> solo quello
+# ✅ Admin protetto con password (B) + correzioni che diventano "memoria" (autoapprendimento controllato)
+# ✅ Topic reset + guardrail hard su retrieval debole
 
 import os
-import re
 import json
+import re
 import hashlib
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -18,7 +19,7 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-# Optional (precision boost): rank-bm25
+# Optional: BM25
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
     BM25_AVAILABLE = True
@@ -32,9 +33,836 @@ except Exception:
 APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
 
 PDF_PATH = os.path.join("documenti", "ccnl.pdf")
-IPZS_PERMESSI_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
+IPZS_PERMESSI_TXT = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
 
-# Logo (opzionale)
+INDEX_DIR = "index_uilcom"
+VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
+META_PATH = os.path.join(INDEX_DIR, "chunks.json")
+
+# Memoria (autoapprendimento controllato)
+MEMORY_DIR = "memoria"
+MEMORY_PATH = os.path.join(MEMORY_DIR, "memoria_uilcom.json")
+MEMVEC_PATH = os.path.join(MEMORY_DIR, "memoria_vectors.npy")
+
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+
+TOP_K_PER_QUERY = 10
+TOP_K_FINAL = 14
+MAX_MULTI_QUERIES = 10
+
+# Memoria breve in chat (solo stesso topic)
+MEMORY_USER_TURNS = 3
+
+# Hard guardrail retrieval documenti
+MIN_BEST_SIMILARITY = 0.24
+MIN_SELECTED_CHUNKS = 3
+
+# Autoapprendimento: soglia match su memoria validata admin
+MEMORY_MATCH_THRESHOLD = 0.86  # alza/abbassa se necessario
+
+# LLM
+LLM_MODEL = "gpt-4o-mini"
+LLM_TEMPERATURE = 0
+
+
+# ============================================================
+# SECRETS
+# ============================================================
+def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
+    try:
+        if key in st.secrets:  # type: ignore
+            return str(st.secrets[key])  # type: ignore
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
+def sha256_text(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin (B)
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
+
+
+# ============================================================
+# PAGE SETUP
+# ============================================================
+st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
+
+# Header (stile "chatgpt-like": pulito)
+st.title(APP_TITLE)
+st.markdown(
+    "**Accesso riservato agli iscritti UILCOM**  \n"
+    "Strumento informativo per consultare **CCNL Grafici Editoria** e **Documento IPZS (Permessi/Giustificativi)**.  \n\n"
+    "⚠️ Le risposte sono generate **solo** in base ai documenti caricati. "
+    "Le citazioni sono incluse per verifica diretta. "
+    "Per casi specifici/interpretazioni: RSU/UILCOM o HR."
+)
+st.divider()
+
+
+# ============================================================
+# AUTH ISCRITTI
+# ============================================================
+if "auth_ok" not in st.session_state:
+    st.session_state.auth_ok = False
+
+if UILCOM_PASSWORD:
+    with st.expander("🔒 Accesso iscritti UILCOM", expanded=not st.session_state.auth_ok):
+        pwd_in = st.text_input("Password iscritti", type="password", placeholder="Inserisci password iscritti")
+        if st.button("Entra", use_container_width=True):
+            if pwd_in == UILCOM_PASSWORD:
+                st.session_state.auth_ok = True
+                st.success("Accesso consentito.")
+            else:
+                st.session_state.auth_ok = False
+                st.error("Password non corretta.")
+else:
+    st.warning("UILCOM_PASSWORD non impostata. Imposta in Secrets (Streamlit) o variabile d’ambiente.")
+    # sviluppo locale:
+    # st.session_state.auth_ok = True
+
+if not st.session_state.auth_ok:
+    st.stop()
+
+
+# ============================================================
+# ADMIN (B) — password protetta
+# ============================================================
+if "is_admin" not in st.session_state:
+    st.session_state.is_admin = False
+
+with st.sidebar:
+    st.header("⚙️ Controlli")
+
+    st.subheader("🧠 Admin (protetto)")
+    if ADMIN_PASSWORD:
+        admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Login admin", use_container_width=True):
+                if admin_in == ADMIN_PASSWORD:
+                    st.session_state.is_admin = True
+                    st.success("Admin attivo.")
+                else:
+                    st.session_state.is_admin = False
+                    st.error("Password admin errata.")
+        with c2:
+            if st.button("Logout", use_container_width=True):
+                st.session_state.is_admin = False
+    else:
+        st.caption("ADMIN_PASSWORD non impostata (Secrets).")
+
+    st.divider()
+
+    # Index management
+    st.subheader("📦 Indice documenti")
+    ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
+    st.write("Indice presente:", "✅" if ok_index else "❌")
+
+    if st.button("Indicizza / Reindicizza", use_container_width=True):
+        try:
+            with st.spinner("Indicizzazione in corso (CCNL + IPZS permessi)..."):
+                if not os.path.exists(PDF_PATH):
+                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH}")
+                if not os.path.exists(IPZS_PERMESSI_TXT):
+                    raise FileNotFoundError(f"Non trovo il TXT: {IPZS_PERMESSI_TXT}")
+
+                if not OPENAI_API_KEY:
+                    raise RuntimeError("Manca OPENAI_API_KEY in Secrets/variabili ambiente.")
+
+                os.makedirs(INDEX_DIR, exist_ok=True)
+
+                # ---- CCNL PDF ----
+                loader = PyPDFLoader(PDF_PATH)
+                docs_pdf = loader.load()  # each has metadata.page (0-based)
+
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP
+                )
+                chunks_pdf = splitter.split_documents(docs_pdf)
+
+                meta_all: List[Dict[str, Any]] = []
+                texts_all: List[str] = []
+
+                for c in chunks_pdf:
+                    page_1based = int(c.metadata.get("page", 0)) + 1
+                    text = c.page_content or ""
+                    texts_all.append(text)
+                    meta_all.append({
+                        "source": "CCNL",
+                        "page": page_1based,
+                        "section": "",
+                        "text": text
+                    })
+
+                # ---- IPZS TXT (Permessi) ----
+                with open(IPZS_PERMESSI_TXT, "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read()
+
+                # spezza in blocchi
+                chunks_txt = splitter.create_documents([txt])
+                # però vogliamo anche "sezioni" riconoscibili (titoli all caps) per citazioni migliori
+                # aggiungiamo section heuristica per ogni chunk
+                for c in chunks_txt:
+                    t = c.page_content or ""
+                    # cerca un titolo vicino all’inizio del chunk
+                    m = re.search(r"(?m)^[A-Z0-9\.\'\(\)\s]{5,}$", t.strip())
+                    section = (m.group(0).strip() if m else "IPZS_PERMESSI")
+                    texts_all.append(t)
+                    meta_all.append({
+                        "source": "IPZS_PERMESSI",
+                        "page": 0,
+                        "section": section[:80],
+                        "text": t
+                    })
+
+                # Embeddings
+                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                vectors = emb.embed_documents(texts_all)
+                vectors = np.array(vectors, dtype=np.float32)
+
+                np.save(VEC_PATH, vectors)
+                with open(META_PATH, "w", encoding="utf-8") as f:
+                    json.dump(meta_all, f, ensure_ascii=False)
+
+            st.success(f"Indicizzazione completata. Chunk totali: {len(meta_all)}")
+            st.rerun()
+        except Exception as e:
+            st.error(str(e))
+
+    if st.button("🧹 Nuova chat", use_container_width=True):
+        st.session_state.messages = []
+        st.session_state.last_topic = None
+        st.rerun()
+
+    st.divider()
+    st.caption("Se Streamlit non aggiorna: Manage app → Reboot.")
+
+
+# ============================================================
+# HARD FAIL IF NO OPENAI KEY
+# ============================================================
+if not OPENAI_API_KEY:
+    st.error(
+        "Manca **OPENAI_API_KEY**.\n\n"
+        "Streamlit Cloud: Settings → Secrets → OPENAI_API_KEY\n"
+        "Locale: variabile d’ambiente OPENAI_API_KEY"
+    )
+    st.stop()
+
+
+# ============================================================
+# UTIL — VECTOR SEARCH
+# ============================================================
+def normalize_rows(mat: np.ndarray) -> np.ndarray:
+    return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
+
+def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
+    q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+    return mat_norm @ q
+
+def load_index() -> Tuple[np.ndarray, List[Dict[str, Any]]]:
+    vectors = np.load(VEC_PATH)
+    with open(META_PATH, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    fixed = []
+    for item in meta:
+        if isinstance(item, dict) and "text" in item:
+            fixed.append({
+                "source": item.get("source", "?"),
+                "page": item.get("page", 0),
+                "section": item.get("section", ""),
+                "text": item.get("text", "")
+            })
+        else:
+            fixed.append({"source": "?", "page": 0, "section": "", "text": str(item)})
+    return vectors, fixed
+
+def unique_citations(chunks: List[Dict[str, Any]], max_items: int = 10) -> Dict[str, Any]:
+    ccnl_pages: List[int] = []
+    ipzs_sections: List[str] = []
+
+    for c in chunks:
+        src = c.get("source", "")
+        if src == "CCNL":
+            try:
+                p = int(c.get("page", 0))
+                if p and p not in ccnl_pages:
+                    ccnl_pages.append(p)
+            except Exception:
+                pass
+        elif src == "IPZS_PERMESSI":
+            sec = (c.get("section", "") or "").strip()
+            if sec and sec not in ipzs_sections:
+                ipzs_sections.append(sec)
+
+        if (len(ccnl_pages) + len(ipzs_sections)) >= max_items:
+            break
+
+    return {"ccnl_pages": sorted(ccnl_pages), "ipzs_sections": ipzs_sections[:max_items]}
+
+def format_sources(cits: Dict[str, Any]) -> str:
+    parts = []
+    pages = cits.get("ccnl_pages", []) or []
+    secs = cits.get("ipzs_sections", []) or []
+    if pages:
+        if len(pages) == 1:
+            parts.append(f"**Fonte:** CCNL (pag. {pages[0]})")
+        else:
+            parts.append(f"**Fonte:** CCNL (pagg. {', '.join(map(str, pages))})")
+    if secs:
+        parts.append(f"**Fonte:** Documento IPZS Permessi (sez.: {', '.join(secs[:6])}{'…' if len(secs) > 6 else ''})")
+    return "\n".join(parts).strip()
+
+
+# ============================================================
+# IPZS PERMESSI — PARSER DETERMINISTICO (PER ELENCO COMPLETO)
+# ============================================================
+def parse_ipzs_permessi_sections(txt_path: str) -> List[Dict[str, str]]:
+    """
+    Estrae sezioni dal TXT IPZS.
+    Regola: riga titolo in MAIUSCOLO (o con punti) seguita da 'Descrizione:' e testo fino al prossimo titolo.
+    """
+    if not os.path.exists(txt_path):
+        return []
+
+    with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+        raw = f.read()
+
+    # normalizza
+    raw = raw.replace("\r\n", "\n").replace("\r", "\n")
+
+    # individua i titoli (all caps)
+    title_re = re.compile(r"(?m)^(?!FINE DOCUMENTO)([A-Z0-9][A-Z0-9\.\'\(\)\s]{3,})\s*$")
+    titles = [(m.start(), m.group(1).strip()) for m in title_re.finditer(raw)]
+
+    sections: List[Dict[str, str]] = []
+    for i, (pos, title) in enumerate(titles):
+        end = titles[i + 1][0] if i + 1 < len(titles) else len(raw)
+        block = raw[pos:end].strip()
+
+        # prova a togliere il titolo dal blocco
+        block_wo_title = re.sub(r"(?m)^" + re.escape(title) + r"\s*$", "", block, count=1).strip()
+
+        # prova a estrarre la descrizione da "Descrizione:"
+        mdesc = re.search(r"(?is)descrizione\s*:\s*(.*)$", block_wo_title)
+        desc = (mdesc.group(1).strip() if mdesc else block_wo_title.strip())
+
+        # pulizia
+        desc = re.sub(r"(?m)^\-+\s*$", "", desc).strip()
+        desc = re.sub(r"\n{3,}", "\n\n", desc).strip()
+
+        if len(title) >= 3 and len(desc) >= 10:
+            sections.append({"title": title, "desc": desc})
+
+    # de-dup titoli
+    out, seen = [], set()
+    for s in sections:
+        key = s["title"].strip().lower()
+        if key not in seen:
+            out.append(s)
+            seen.add(key)
+
+    return out
+
+def is_generic_permessi_question(q: str) -> bool:
+    ql = q.lower()
+    patterns = [
+        "a quali permessi ha diritto",
+        "quali permessi ha diritto",
+        "quali permessi ha a disposizione",
+        "elenco permessi",
+        "tutti i permessi",
+        "lista permessi",
+        "che permessi ci sono",
+        "tipologie di permessi",
+        "permessi disponibili",
+        "permessi ipzs",
+    ]
+    return any(p in ql for p in patterns)
+
+def find_permesso_specific(sections: List[Dict[str, str]], user_q: str) -> Optional[Dict[str, str]]:
+    ql = user_q.lower().strip()
+
+    # se l’utente scrive RAO/ROL in modo secco
+    direct_keys = ["rao", "r.a.o", "rol", "r.o.l", "donazione sangue", "permessi elettorali", "testimonianza civile"]
+    for dk in direct_keys:
+        if dk in ql:
+            # cerca in titoli
+            for s in sections:
+                if dk.replace(".", "") in s["title"].lower().replace(".", ""):
+                    return s
+
+    # fallback: match per parole significative
+    tokens = [t for t in re.split(r"[^a-zA-Z0-9àèéìòù]+", ql) if len(t) >= 3]
+    if not tokens:
+        return None
+
+    best = None
+    best_score = 0
+    for s in sections:
+        title_low = s["title"].lower()
+        desc_low = s["desc"].lower()
+        score = 0
+        for t in tokens:
+            if t in title_low:
+                score += 3
+            elif t in desc_low:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best = s
+
+    # soglia minima
+    if best and best_score >= 3:
+        return best
+    return None
+
+def render_permessi_list(sections: List[Dict[str, str]]) -> str:
+    if not sections:
+        return "Non ho trovato l’elenco dei permessi nel Documento IPZS caricato."
+
+    lines = []
+    lines.append("Ecco l’**elenco dei permessi/giustificativi** presenti nel **Documento IPZS** (con descrizione sintetica):\n")
+    for i, s in enumerate(sections, start=1):
+        title = s["title"].strip()
+        desc = " ".join(s["desc"].split())
+        # taglia descrizione per non fare muri
+        if len(desc) > 260:
+            desc = desc[:260].rstrip() + "…"
+        lines.append(f"**{i}. {title}**  \n{desc}\n")
+    lines.append("**Fonte:** Documento IPZS Permessi (elenco completo)")
+    return "\n".join(lines).strip()
+
+def render_permesso_specific(s: Dict[str, str]) -> str:
+    title = s["title"].strip()
+    desc = s["desc"].strip()
+    return f"**{title}**\n\n{desc}\n\n**Fonte:** Documento IPZS Permessi (sez.: {title})"
+
+
+# ============================================================
+# TOPIC DETECTOR (per memoria breve e guardrail)
+# ============================================================
+MALATTIA_TRIGGERS = ["malattia", "comporto", "visita fiscale", "reperibil", "ricovero", "infortunio"]
+PERMESSI_TRIGGERS = ["permess", "rao", "rol", "donazione", "elettoral", "lutto", "matrimonio", "studio", "esami", "104"]
+STRAORD_TRIGGERS = ["straordin", "maggioraz", "notturn", "festiv"]
+MANSIONI_TRIGGERS = ["mansioni superiori", "categoria superiore", "inquadramento superiore", "30 giorni", "60 giorni"]
+
+def detect_topic(q: str) -> str:
+    ql = q.lower()
+    if any(t in ql for t in MALATTIA_TRIGGERS):
+        return "malattia"
+    if any(t in ql for t in MANSIONI_TRIGGERS):
+        return "mansioni"
+    if any(t in ql for t in PERMESSI_TRIGGERS):
+        return "permessi"
+    if any(t in ql for t in STRAORD_TRIGGERS):
+        return "straordinari"
+    return "altro"
+
+def build_enriched_question(current_q: str, current_topic: str) -> str:
+    if "messages" not in st.session_state:
+        return current_q.strip()
+
+    last_topic = st.session_state.get("last_topic", None)
+    if last_topic and last_topic != current_topic:
+        return current_q.strip()
+
+    user_msgs = [m["content"] for m in st.session_state.messages if m.get("role") == "user" and m.get("content")]
+    prev = user_msgs[:-1] if (user_msgs and user_msgs[-1].strip() == current_q.strip()) else user_msgs
+    last = prev[-MEMORY_USER_TURNS:] if prev else []
+    last = [x.strip() for x in last if x.strip()]
+    if not last:
+        return current_q.strip()
+
+    return (
+        "CONTESTO CONVERSAZIONE (ultime richieste utente, stesso argomento):\n"
+        + "\n".join([f"- {x}" for x in last])
+        + "\n\nDOMANDA ATTUALE:\n"
+        + current_q.strip()
+    )
+
+
+# ============================================================
+# QUERY BUILDER
+# ============================================================
+def build_queries(q: str) -> List[str]:
+    q0 = q.strip()
+    ql = q0.lower()
+
+    qs = [q0, f"{q0} CCNL", f"{q0} documento IPZS permessi"]
+
+    if "permess" in ql or "rao" in ql or "rol" in ql:
+        qs += [
+            "permessi IPZS elenco permessi giustificativi",
+            "RAO permesso retribuito IPZS",
+            "ROL riduzione orario permesso retribuito",
+            "donazione sangue permesso giornaliero retribuito",
+            "permessi elettorali permesso giornaliero retribuito",
+        ]
+
+    if "malatt" in ql:
+        qs += [
+            "malattia trattamento economico integrazione",
+            "malattia periodo di comporto conservazione posto",
+            "malattia reperibilità visite fiscali",
+        ]
+
+    if "straordin" in ql or "notturn" in ql:
+        qs += [
+            "lavoro straordinario maggiorazioni",
+            "lavoro notturno maggiorazioni",
+            "lavoro festivo maggiorazioni",
+        ]
+
+    if "mansioni superiori" in ql or "inquadramento superiore" in ql:
+        qs += [
+            "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
+            "mansioni superiori trattamento corrispondente",
+            "sostituzione conservazione del posto mansioni superiori",
+        ]
+
+    out, seen = [], set()
+    for x in qs:
+        x = x.strip()
+        if x and x not in seen:
+            out.append(x)
+            seen.add(x)
+
+    return out[:MAX_MULTI_QUERIES]
+
+
+# ============================================================
+# BM25 RERANK
+# ============================================================
+def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not BM25_AVAILABLE or not candidates:
+        return candidates
+    corpus = [(c.get("text") or "").lower().split() for c in candidates]
+    bm25 = BM25Okapi(corpus)
+    scores = bm25.get_scores(query.lower().split())
+    idx = np.argsort(-np.array(scores))
+    return [candidates[int(i)] for i in idx]
+
+
+# ============================================================
+# MEMORIA UILCOM (autoapprendimento controllato)
+# ============================================================
+def ensure_memory_files():
+    os.makedirs(MEMORY_DIR, exist_ok=True)
+    if not os.path.exists(MEMORY_PATH):
+        with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+            json.dump([], f, ensure_ascii=False)
+    if not os.path.exists(MEMVEC_PATH):
+        np.save(MEMVEC_PATH, np.zeros((0, 1536), dtype=np.float32))  # dimensione tipica embeddings
+
+def load_memory() -> Tuple[List[Dict[str, Any]], np.ndarray]:
+    ensure_memory_files()
+    with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+        items = json.load(f)
+    try:
+        vecs = np.load(MEMVEC_PATH)
+    except Exception:
+        vecs = np.zeros((0, 1536), dtype=np.float32)
+    if not isinstance(items, list):
+        items = []
+    return items, vecs
+
+def save_memory(items: List[Dict[str, Any]], vecs: np.ndarray):
+    ensure_memory_files()
+    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=2)
+    np.save(MEMVEC_PATH, vecs.astype(np.float32))
+
+def memory_lookup(user_q: str, emb: OpenAIEmbeddings) -> Tuple[Optional[Dict[str, Any]], float]:
+    items, vecs = load_memory()
+    if vecs.shape[0] == 0 or len(items) == 0:
+        return None, 0.0
+
+    qvec = np.array(emb.embed_query(user_q), dtype=np.float32)
+    mat = normalize_rows(vecs)
+    sims = cosine_scores(qvec, mat)
+    best_i = int(np.argmax(sims))
+    best_s = float(sims[best_i])
+
+    if best_s >= MEMORY_MATCH_THRESHOLD:
+        return items[best_i], best_s
+    return None, best_s
+
+
+# ============================================================
+# SYSTEM RULES
+# ============================================================
+RULES = """
+Sei l’assistente UILCOM per lavoratori IPZS.
+Devi rispondere in modo chiaro e pratico basandoti SOLO su:
+- Contesto estratto dal CCNL (PDF)
+- Contesto estratto dal Documento IPZS Permessi (TXT)
+- Memoria UILCOM SOLO se "validata admin"
+
+Non inventare informazioni.
+Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nei documenti caricati."
+
+FORMATO:
+Risposta diretta + citazioni finali (Fonte ...).
+"""
+
+
+# ============================================================
+# CHAT STATE
+# ============================================================
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "last_topic" not in st.session_state:
+    st.session_state.last_topic = None
+
+# Render chat
+for m in st.session_state.messages:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+        # Admin tools: correzione risposta
+        if st.session_state.is_admin and m["role"] == "assistant":
+            dbg = m.get("debug", None)
+            if dbg:
+                with st.expander("🧠 Admin debug", expanded=False):
+                    st.write("**Topic:**", dbg.get("topic"))
+                    st.write("**Best similarity docs:**", dbg.get("best_similarity"))
+                    st.write("**Query usate:**")
+                    st.code("\n".join(dbg.get("queries", [])))
+                    st.write("**Citazioni:**")
+                    st.code(dbg.get("cit_line", ""))
+
+                # Pulsante correzione (autoapprendimento controllato)
+                with st.expander("✅ Correggi e salva in memoria UILCOM (autoapprendimento)", expanded=False):
+                    corr = st.text_area("Incolla qui la risposta corretta (quella che vuoi diventi definitiva)", value="", height=160, key=f"corr_{dbg.get('msg_id','')}")
+                    if st.button("Salva risposta corretta", key=f"save_{dbg.get('msg_id','')}"):
+                        try:
+                            emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                            items, vecs = load_memory()
+
+                            q = dbg.get("user_q", "").strip()
+                            if not q:
+                                st.error("Domanda utente non trovata nel debug.")
+                            elif not corr.strip():
+                                st.error("Devi inserire una risposta corretta.")
+                            else:
+                                qvec = np.array(emb.embed_query(q), dtype=np.float32).reshape(1, -1)
+                                # append
+                                items.append({
+                                    "question": q,
+                                    "answer": corr.strip(),
+                                    "timestamp": datetime.now().isoformat(timespec="seconds"),
+                                    "topic": dbg.get("topic", ""),
+                                    "source_note": "Memoria UILCOM (validata admin)"
+                                })
+                                # vecs could be empty or different dim; handle robust
+                                if vecs.shape[0] == 0:
+                                    vecs = qvec
+                                else:
+                                    # if dim mismatch, re-init
+                                    if vecs.shape[1] != qvec.shape[1]:
+                                        vecs = np.vstack([vecs[:, :qvec.shape[1]], qvec]) if vecs.shape[1] > qvec.shape[1] else np.vstack([vecs, qvec])
+                                    else:
+                                        vecs = np.vstack([vecs, qvec])
+
+                                save_memory(items, vecs)
+                                st.success("Salvato ✅ Da ora la chatbot risponderà prima con questa risposta (se domanda simile).")
+                        except Exception as e:
+                            st.error(str(e))
+
+
+user_input = st.chat_input("Scrivi una domanda (permessi IPZS, RAO/ROL, malattia, straordinari, ecc.)")
+
+if not user_input:
+    st.stop()
+
+# Require index
+if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": "Prima devo indicizzare i documenti: apri la barra laterale e clicca **Indicizza / Reindicizza**.",
+    })
+    st.rerun()
+
+# Append user msg
+st.session_state.messages.append({"role": "user", "content": user_input})
+
+
+# ============================================================
+# PIPELINE
+# ============================================================
+topic = detect_topic(user_input)
+enriched_q = build_enriched_question(user_input, topic)
+
+emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+
+# 1) AUTOAPPRENDIMENTO (memoria validata admin) — PRIMA di tutto
+mem_hit, mem_sim = memory_lookup(user_input, emb)
+if mem_hit is not None:
+    answer = mem_hit.get("answer", "").strip()
+    stamp = mem_hit.get("timestamp", "")
+    src_line = f"**Fonte:** Memoria UILCOM (validata admin, {stamp})"
+    content = (answer + "\n\n" + src_line).strip()
+
+    payload = {"role": "assistant", "content": content}
+    if st.session_state.is_admin:
+        payload["debug"] = {
+            "msg_id": sha256_text(user_input + str(datetime.now().timestamp()))[:10],
+            "topic": topic,
+            "user_q": user_input,
+            "queries": ["MEMORIA UILCOM (lookup)"],
+            "best_similarity": mem_sim,
+            "cit_line": src_line,
+        }
+
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+# 2) CASO SPECIALE: PERMESSI IPZS — elenco completo o singolo permesso (deterministico)
+ipzs_sections = parse_ipzs_permessi_sections(IPZS_PERMESSI_TXT)
+
+if topic == "permessi":
+    # se domanda generica -> elenco completo
+    if is_generic_permessi_question(user_input):
+        content = render_permessi_list(ipzs_sections)
+
+        payload = {"role": "assistant", "content": content}
+        if st.session_state.is_admin:
+            payload["debug"] = {
+                "msg_id": sha256_text(user_input + str(datetime.now().timestamp()))[:10],
+                "topic": topic,
+                "user_q": user_input,
+                "queries": ["IPZS TXT (parser elenco completo)"],
+                "best_similarity": None,
+                "cit_line": "**Fonte:** Documento IPZS Permessi (elenco completo)",
+            }
+
+        st.session_state.last_topic = topic
+        st.session_state.messages.append(payload)
+        st.rerun()
+
+    # se domanda specifica -> prova a prendere una singola sezione IPZS
+    spec = find_permesso_specific(ipzs_sections, user_input)
+    if spec is not None:
+        content = render_permesso_specific(spec)
+
+        payload = {"role": "assistant", "content": content}
+        if st.session_state.is_admin:
+            payload["debug"] = {
+                "msg_id": sha256_text(user_input + str(datetime.now().timestamp()))[:10],
+                "topic": topic,
+                "user_q": user_input,
+                "queries": ["IPZS TXT (parser permesso specifico)"],
+                "best_similarity": None,
+                "cit_line": f"**Fonte:** Documento IPZS Permessi (sez.: {spec['title']})",
+            }
+
+        st.session_state.last_topic = topic
+        st.session_state.messages.append(payload)
+        st.rerun()
+
+# 3) RETRIEVAL SU INDICE (CCNL + IPZS chunks) + LLM
+vectors, meta = load_index()
+mat_norm = normalize_rows(vectors)
+queries = build_queries(enriched_q)
+
+scores_best: Dict[int, float] = {}
+best_similarity = 0.0
+
+for q in queries:
+    qvec = np.array(emb.embed_query(q), dtype=np.float32)
+    sims = cosine_scores(qvec, mat_norm)
+    top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
+    for i in top_idx:
+        s = float(sims[int(i)])
+        if s > best_similarity:
+            best_similarity = s
+        if (int(i) not in scores_best) or (s > scores_best[int(i)]):
+            scores_best[int(i)] = s
+
+final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
+selected = [meta[i] for i in final_idx]
+
+selected = bm25_rerank(enriched_q, selected)
+
+retrieval_ok = (best_similarity >= MIN_BEST_SIMILARITY) and (len(selected) >= MIN_SELECTED_CHUNKS)
+
+cits = unique_citations(selected, max_items=10)
+cit_line = format_sources(cits)
+
+def hard_not_found_message() -> str:
+    return "Non ho trovato la risposta nei documenti caricati."
+
+if not retrieval_ok:
+    payload = {"role": "assistant", "content": hard_not_found_message()}
+    if st.session_state.is_admin:
+        payload["debug"] = {
+            "msg_id": sha256_text(user_input + str(datetime.now().timestamp()))[:10],
+            "topic": topic,
+            "user_q": user_input,
+            "queries": queries,
+            "best_similarity": best_similarity,
+            "cit_line": cit_line,
+            "note": "retrieval_ok=False -> risposta bloccata",
+        }
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+# LLM context
+context = "\n\n---\n\n".join(
+    [f"[{c.get('source','?')} | Pagina {c.get('page','?')} | Sez {c.get('section','')}] {c.get('text','')}" for c in selected]
+)
+
+llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
+
+prompt = f"""
+{RULES}
+
+DOMANDA (UTENTE):
+{user_input}
+
+DOMANDA ARRICCHITA (MEMORIA BREVE - solo stesso topic):
+{enriched_q}
+
+CONTESTO ESTRATTO DAI DOCUMENTI:
+{context}
+
+ISTRUZIONI IMPORTANTI:
+- Rispondi SOLO usando ciò che trovi nel contesto.
+- Se non c'è, di' che non hai trovato nei documenti caricati.
+- Chiudi SEMPRE con le fonti (CCNL pagine / IPZS sezioni) se disponibili.
+"""
+
+try:
+    raw = llm.invoke(prompt).content
+except Exception as e:
+    raw = f"Errore nel generare la risposta: {e}"
+
+public_ans = (raw or "").strip()
+if cit_line and ("fonte" not in public_ans.lower()):
+    public_ans = public_ans.rstrip() + "\n\n" + cit_line
+
+payload = {"role": "assistant", "content": public_ans}
+if st.session_state.is_admin:
+    payload["debug"] = {
+        "msg_id": sha256_text(user_input + str(datetime.now().timestamp()))[:10],
+        "topic": topic,
+        "user_q": user_input,
+        "queries": queries,
+        "best_similarity": best_similarity,
+        "cit_line": cit_line,
+    }
+
+st.session_state.last_topic = topic
+st.session_state.messages.append(payload)
+st.rerun()# Logo (opzionale)
 LOGO_PATH_1 = os.path.join("logo", "logo_uilcom.png")   # consigliato
 LOGO_PATH_2 = "logo_uilcom.png"                         # fallback se lo metti in root
 
@@ -838,3 +1666,4 @@ if st.session_state.is_admin:
 
 st.session_state.messages.append(assistant_payload)
 st.rerun()
+
