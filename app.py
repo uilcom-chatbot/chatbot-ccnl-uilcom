@@ -362,7 +362,74 @@ response = llm.invoke(prompt).content
 st.session_state.messages.append({"role": "user", "content": user_input})
 st.session_state.messages.append({"role": "assistant", "content": response})
 
-st.rerun()
+st.rerun() app.py — Assistente UILCOM IPZS SUPER UPGRADE
+# Versione professionale completa CCNL + Permessi IPZS intelligenti
+
+import os
+import json
+import re
+from typing import List, Dict, Any, Optional
+
+import numpy as np
+import streamlit as st
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
+
+PDF_PATH = os.path.join("documenti", "ccnl.pdf")
+IPZS_PERMESSI_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
+
+INDEX_DIR = "index_ccnl"
+VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
+META_PATH = os.path.join(INDEX_DIR, "chunks.json")
+
+CHUNK_SIZE = 1200
+CHUNK_OVERLAP = 150
+
+LLM_MODEL = "gpt-4o-mini"
+LLM_TEMPERATURE = 0
+
+
+# ============================================================
+# UTILS
+# ============================================================
+
+def clean_text(s: str) -> str:
+    return " ".join((s or "").replace("\ufeff", "").split())
+
+
+def normalize_key(s: str) -> str:
+    s = clean_text(s).lower()
+    return re.sub(r"[^a-z0-9]+", "", s)
+
+
+# ============================================================
+# PERMESSI IPZS LOADER
+# ============================================================
+
+def load_ipzs_permessi(path: str):
+
+    if not os.path.exists(path):
+        return []
+
+    raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+    lines = raw.splitlines()
+
+    entries = []
+    i = 0
+
+    while i < len(lines):
+
+        title = clean_text(lines[i])
+
         if not title or title.lower().startswith("ipzs"):
             i += 1
             continue
