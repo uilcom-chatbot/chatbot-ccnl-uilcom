@@ -64,7 +64,6 @@ APPROVED_META_PATH = os.path.join(INDEX_APPROVED_DIR, "chunks.json")
 # Chunking
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
-
 TOP_K_PER_QUERY = 12
 TOP_K_FINAL = 18
 MAX_MULTI_QUERIES = 8
@@ -95,12 +94,14 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
         pass
     return os.getenv(key, default)
 
+
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
+
+UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")  # password iscritti
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")    # password admin
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")    # obbligatoria
 
 
 # ============================================================
@@ -113,10 +114,12 @@ def ensure_dirs():
     os.makedirs(INDEX_APPROVED_DIR, exist_ok=True)
     os.makedirs(DOC_DIR, exist_ok=True)
 
+
 def append_jsonl(path: str, obj: Dict[str, Any]):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
 
 def read_jsonl(path: str, limit: int = 2000) -> List[Dict[str, Any]]:
     if not os.path.exists(path):
@@ -135,14 +138,16 @@ def read_jsonl(path: str, limit: int = 2000) -> List[Dict[str, Any]]:
                 pass
     return out
 
+
 def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 # ============================================================
-# UI SETUP (ChatGPT-like) — IMPORTANT: NON NASCONDIAMO L'HEADER
+# UI SETUP (ChatGPT-like) — IMPORTANT: NON NASCONDERE L'HEADER
 # ============================================================
 ensure_dirs()
+
 st.set_page_config(
     page_title="Assistente UILCOM IPZS",
     page_icon="🟦",
@@ -150,14 +155,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",  # tasto ☰ visibile, sidebar chiusa di default
 )
 
-# CSS: NON nascondere l'header (altrimenti sparisce il bottone ☰)
 st.markdown(
     """
     <style>
       .block-container { max-width: 900px; padding-top: 1.2rem; }
-
       /* NON TOCCARE header: lì c'è il pulsante ☰ della sidebar su mobile */
-
       .stChatMessage { padding: 0.15rem 0; }
       div.stButton>button { border-radius: 10px; padding: 0.45rem 0.8rem; }
       section[data-testid="stSidebar"] { padding-top: 0.8rem; }
@@ -207,7 +209,7 @@ if not st.session_state.auth_ok:
 
 
 # ============================================================
-# ADMIN SIDEBAR
+# ADMIN / SESSION
 # ============================================================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
@@ -215,12 +217,14 @@ if "is_admin" not in st.session_state:
 if "chat_id" not in st.session_state:
     st.session_state.chat_id = sha256_text(str(time.time()))[:12]
 
+
 # ============================================================
 # CACHED RESOURCES
 # ============================================================
 @st.cache_resource(show_spinner=False)
 def get_embeddings() -> OpenAIEmbeddings:
     return OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+
 
 @st.cache_resource(show_spinner=False)
 def get_llm() -> ChatOpenAI:
@@ -233,9 +237,11 @@ def get_llm() -> ChatOpenAI:
 def normalize_rows(mat: np.ndarray) -> np.ndarray:
     return mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-12)
 
+
 def cosine_scores(query_vec: np.ndarray, mat_norm: np.ndarray) -> np.ndarray:
     q = query_vec / (np.linalg.norm(query_vec) + 1e-12)
     return mat_norm @ q
+
 
 @st.cache_data(show_spinner=False)
 def load_index_cached(vec_path: str, meta_path: str) -> Tuple[np.ndarray, List[Dict[str, Any]], np.ndarray]:
@@ -253,6 +259,7 @@ def load_index_cached(vec_path: str, meta_path: str) -> Tuple[np.ndarray, List[D
     mat_norm = normalize_rows(vectors.astype(np.float32))
     return vectors.astype(np.float32), meta, mat_norm
 
+
 def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if not BM25_AVAILABLE or not candidates:
         return candidates
@@ -261,6 +268,7 @@ def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, 
     scores = bm25.get_scores(query.lower().split())
     idx = np.argsort(-np.array(scores))
     return [candidates[int(i)] for i in idx]
+
 
 def dedup_by_text(chunks: List[Dict[str, Any]], max_out: int) -> List[Dict[str, Any]]:
     seen = set()
@@ -276,6 +284,7 @@ def dedup_by_text(chunks: List[Dict[str, Any]], max_out: int) -> List[Dict[str, 
             break
     return out
 
+
 def unique_pages_ccnl(chunks: List[Dict[str, Any]], max_pages: int = 8) -> List[int]:
     pages: List[int] = []
     for c in chunks:
@@ -289,6 +298,7 @@ def unique_pages_ccnl(chunks: List[Dict[str, Any]], max_pages: int = 8) -> List[
             break
     return pages
 
+
 def format_ccnl_citations(pages: List[int]) -> str:
     if not pages:
         return ""
@@ -297,8 +307,10 @@ def format_ccnl_citations(pages: List[int]) -> str:
         return f"**Fonte:** CCNL (pag. {pages_sorted[0]})"
     return f"**Fonte:** CCNL (pagg. {', '.join(map(str, pages_sorted))})"
 
+
 def extract_evidence(chunks: List[Dict[str, Any]], max_lines: int = 18) -> List[str]:
     patterns = [
+        r"straordin", r"maggioraz", r"indennit", r"notturn", r"festiv", r"domenic",
         r"rao", r"r\.a\.o", r"rol", r"r\.o\.l", r"riduzion",
         r"permess", r"conged", r"retribuit", r"non retribuit",
         r"donazion", r"decesso", r"lutto", r"studio", r"esam", r"104",
@@ -318,6 +330,31 @@ def extract_evidence(chunks: List[Dict[str, Any]], max_lines: int = 18) -> List[
             if len(out) >= max_lines:
                 return out
     return out[:max_lines]
+
+
+# ============================================================
+# 🔥 Filtro lessicale (anti-risposte permessi quando chiedi straordinario)
+# ============================================================
+def lexical_focus_filter(query: str, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    ql = query.lower()
+
+    if "straordin" in ql:
+        must_have = ["straordin", "maggioraz", "compenso", "retribu", "banca ore"]
+    elif any(x in ql for x in ["notturn", "festiv", "domenic"]):
+        must_have = ["notturn", "festiv", "domenic", "maggioraz", "indenn"]
+    elif any(x in ql for x in ["turno", "turnazione", "orario di lavoro"]):
+        must_have = ["turn", "orario", "lavoro", "riposo", "notturn", "festiv"]
+    else:
+        return chunks
+
+    kept = []
+    for c in chunks:
+        txt = (c.get("text") or "").lower()
+        if any(k in txt for k in must_have):
+            kept.append(c)
+
+    # se il filtro svuota troppo, non forzare (meglio avere contesto che nulla)
+    return kept if len(kept) >= 2 else chunks
 
 
 # ============================================================
@@ -380,8 +417,10 @@ def parse_ipzs_permessi_sections(raw_text: str) -> List[Dict[str, str]]:
             seen.add(key)
     return out
 
+
 def ipzs_source_line() -> str:
     return "**Fonte:** Documento IPZS Permessi/Giustificativi (PERMESSI_IPZS_COMPLETO_FINALE.txt)"
+
 
 def is_generic_permessi_list_question(q: str) -> bool:
     ql = q.lower()
@@ -398,8 +437,10 @@ def is_generic_permessi_list_question(q: str) -> bool:
     ]
     return any(t in ql for t in triggers)
 
+
 def extract_specific_permesso_name(q: str, sections_titles: List[str]) -> Optional[str]:
     ql = q.lower()
+
     if re.search(r"\brao\b|\br\.a\.o\b", ql):
         return "RAO"
     if re.search(r"\brol\b|\br\.o\.l\b", ql):
@@ -431,21 +472,44 @@ def extract_specific_permesso_name(q: str, sections_titles: List[str]) -> Option
                 for real in sections_titles:
                     if c.lower() in real.lower() or real.lower() in c.lower():
                         return real
+
     return None
 
 
 # ============================================================
-# ROUTING: IPZS vs CCNL (più solido)
+# ROUTING: IPZS vs CCNL (SUPER SOLIDO)
 # ============================================================
 def detect_route(q: str) -> str:
     ql = q.lower()
+
+    # 🔥 PRIORITÀ CCNL: temi retributivi/orari (NON devono mai finire su IPZS)
+    ccnl_pay_terms = [
+        "straordin", "maggioraz", "retribuz", "compenso", "paga",
+        "indennit", "notturn", "festiv", "domenic",
+        "turno", "turnazione", "orario di lavoro", "banca ore",
+        "lavoro straordinario", "prestazione straordinaria",
+    ]
+    if any(t in ql for t in ccnl_pay_terms):
+        return "CCNL"
+
+    # elenco permessi completo
     if is_generic_permessi_list_question(ql):
         return "IPZS_LIST"
-    if any(x in ql for x in ["rao", "r.a.o", "rol", "r.o.l", "donazione", "cure termali",
-                             "permessi elettorali", "testimonianza", "decesso", "104", "esami", "maternit", "nido"]):
+
+    # permesso specifico
+    if re.search(r"\brao\b|\br\.a\.o\b|\brol\b|\br\.o\.l\b", ql):
         return "IPZS_SINGLE"
+
+    if any(x in ql for x in [
+        "donazione", "cure termali", "permessi elettorali", "testimonianza",
+        "decesso", "104", "esami", "maternit", "nido"
+    ]):
+        return "IPZS_SINGLE"
+
+    # generico su permessi/giustificativi (potrebbe essere misto)
     if "permess" in ql or "giustific" in ql:
         return "MIXED"
+
     return "CCNL"
 
 
@@ -487,8 +551,8 @@ def retrieve_from_index(
     scores_best: Dict[int, float] = {}
     best_similarity = 0.0
 
-    for q in queries:
-        qvec = np.array(emb.embed_query(q), dtype=np.float32)
+    for qq in queries:
+        qvec = np.array(emb.embed_query(qq), dtype=np.float32)
         sims = cosine_scores(qvec, mat_norm)
         top_idx = np.argsort(-sims)[:top_k_per_query]
         for i in top_idx:
@@ -499,22 +563,24 @@ def retrieve_from_index(
 
     final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:top_k_final]
     selected = [meta[i] for i in final_idx]
+
     selected = bm25_rerank(query, selected)
     selected = dedup_by_text(selected, max_out=top_k_final)
-
     evidence = extract_evidence(selected, max_lines=MAX_EVIDENCE_LINES)
+
     return selected, best_similarity, queries, evidence
 
 
 def hard_not_found_ccnl() -> str:
     return "Non ho trovato la risposta nel CCNL caricato."
 
+
 def hard_not_found_generic() -> str:
     return "Non ho trovato la risposta nei documenti caricati."
 
 
 # ============================================================
-# CCNL LLM PROMPT
+# CCNL LLM PROMPT (⚠️ triple quote OK)
 # ============================================================
 RULES_CCNL = """
 Sei l’assistente UILCOM per lavoratori IPZS.
@@ -526,6 +592,7 @@ REGOLE:
 2) Chiudi SEMPRE con: "Fonte: CCNL (pag. ...)" usando solo le pagine presenti nel contesto.
 3) Se l’utente chiede permessi ma nel contesto non ci sono dettagli, non inventare.
 """
+
 
 def split_public(text: str) -> str:
     m = re.search(r"<PUBLIC>(.*?)</PUBLIC>", text, flags=re.DOTALL | re.IGNORECASE)
@@ -551,8 +618,8 @@ def do_reindex_all():
 
     ccnl_texts = [c.page_content for c in ccnl_chunks]
     ccnl_pages = [(int(c.metadata.get("page", 0)) + 1) for c in ccnl_chunks]  # 1-based
-
     ccnl_vectors = np.array(emb.embed_documents(ccnl_texts), dtype=np.float32)
+
     np.save(CCNL_VEC_PATH, ccnl_vectors)
     with open(CCNL_META_PATH, "w", encoding="utf-8") as f:
         json.dump([{"page": p, "text": t} for p, t in zip(ccnl_pages, ccnl_texts)], f, ensure_ascii=False)
@@ -566,11 +633,12 @@ def do_reindex_all():
 
     ipzs_chunks = splitter.split_text(ipzs_raw)
     ipzs_vectors = np.array(emb.embed_documents(ipzs_chunks), dtype=np.float32)
+
     np.save(IPZS_VEC_PATH, ipzs_vectors)
     with open(IPZS_META_PATH, "w", encoding="utf-8") as f:
         json.dump([{"page": "IPZS", "text": t} for t in ipzs_chunks], f, ensure_ascii=False)
 
-    # ---- Q/A approvate (autoapprendimento controllato) ----
+    # ---- Q/A approvate ----
     approved_rows = read_jsonl(APPROVED_QA_FILE, limit=5000)
     qa_texts: List[str] = []
     qa_meta: List[Dict[str, Any]] = []
@@ -597,7 +665,7 @@ def do_reindex_all():
 
 
 # ============================================================
-# SIDEBAR CONTENT (ora il tasto ☰ si vede sempre)
+# SIDEBAR CONTENT
 # ============================================================
 with st.sidebar:
     st.header("⚙️ Controlli")
@@ -619,11 +687,12 @@ with st.sidebar:
     st.write("Indice Q/A approvate:", "✅" if ok_approved else "❌")
 
     st.caption("Se aggiorni documenti o Q/A approvate → reindicizza.")
-
     st.divider()
+
     st.subheader("🧠 Admin")
     if ADMIN_PASSWORD:
         admin_in = st.text_input("Password admin", type="password", placeholder="Solo admin UILCOM", key="admin_pwd")
+
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Login", use_container_width=True):
@@ -661,7 +730,7 @@ with st.sidebar:
                 st.write(read_jsonl(FEEDBACK_FILE, limit=200)[-30:])
 
         with st.expander("✅ Auto-apprendimento controllato (Q/A)", expanded=False):
-            st.caption("Incolla domanda+risposta che vuoi rendere 'conoscenza approvata'. Poi reindicizza.")
+            st.caption("Incolla domanda+risposta da rendere 'conoscenza approvata'. Poi reindicizza.")
             q = st.text_area("Domanda approvata", height=80, key="qa_q")
             a = st.text_area("Risposta approvata", height=120, key="qa_a")
             if st.button("Salva Q/A approvata", use_container_width=True):
@@ -691,6 +760,7 @@ if not OPENAI_API_KEY:
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+
 def trimmed_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     if len(messages) <= MAX_HISTORY_TURNS * 2:
         return messages
@@ -701,7 +771,6 @@ def trimmed_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 for i, m in enumerate(st.session_state.messages):
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
-
         if m["role"] == "assistant" and m.get("citations"):
             st.caption(m["citations"])
 
@@ -755,6 +824,7 @@ if not user_input:
     st.stop()
 
 user_input = user_input.strip()
+
 if user_input.lower() in ("/nuova", "/reset", "/new"):
     st.session_state.messages = []
     st.session_state.chat_id = sha256_text(str(time.time()))[:12]
@@ -785,14 +855,14 @@ route = detect_route(user_input)
 
 
 # ============================================================
-# IPZS LIST
+# IPZS LIST (elenco completo permessi)
 # ============================================================
 if route == "IPZS_LIST":
     try:
         with open(IPZS_PERMESSI_PATH, "r", encoding="utf-8", errors="ignore") as f:
             ipzs_raw = f.read()
-        sections = parse_ipzs_permessi_sections(ipzs_raw)
 
+        sections = parse_ipzs_permessi_sections(ipzs_raw)
         if not sections:
             public_ans = hard_not_found_generic()
         else:
@@ -802,6 +872,8 @@ if route == "IPZS_LIST":
             for s in sections:
                 title = s["title"]
                 desc = s["desc"]
+
+                # preview: 1-2 righe utili (senza stampare tutto)
                 desc_short = []
                 for ln in desc.splitlines():
                     ln = ln.strip()
@@ -824,14 +896,14 @@ if route == "IPZS_LIST":
             "content": public_ans,
             "citations": ipzs_source_line(),
             "question": user_input,
+            "debug": {"route": route},
         }
-
         st.session_state.messages.append(assistant_payload)
         append_jsonl(LOGS_FILE, {"ts": now_iso(), "chat_id": st.session_state.chat_id, "event": "answer", "route": route})
         st.rerun()
 
     except Exception:
-        assistant_payload = {"role": "assistant", "content": hard_not_found_generic(), "question": user_input}
+        assistant_payload = {"role": "assistant", "content": hard_not_found_generic(), "question": user_input, "debug": {"route": route}}
         st.session_state.messages.append(assistant_payload)
         st.rerun()
 
@@ -843,6 +915,7 @@ def answer_from_ipzs(user_q: str) -> Tuple[Optional[str], Dict[str, Any]]:
     selected_ipzs, best_ipzs, queries_ipzs, evidence_ipzs = retrieve_from_index(
         user_q, IPZS_VEC_PATH, IPZS_META_PATH, emb
     )
+
     retrieval_ok_ipzs = (best_ipzs >= MIN_BEST_SIMILARITY) and (len(selected_ipzs) >= MIN_SELECTED_CHUNKS)
 
     try:
@@ -864,6 +937,7 @@ def answer_from_ipzs(user_q: str) -> Tuple[Optional[str], Dict[str, Any]]:
             "note": "retrieval_ok=False",
         }
 
+    # Se capisco il permesso specifico, rispondo SOLO quello
     if sections and wanted:
         match = None
         if wanted == "RAO":
@@ -893,6 +967,7 @@ def answer_from_ipzs(user_q: str) -> Tuple[Optional[str], Dict[str, Any]]:
                 "note": f"Permesso specifico richiesto: {wanted}",
             }
 
+    # fallback: mostra chunk (se proprio non aggancio il titolo)
     context = "\n\n---\n\n".join([c.get("text", "") for c in selected_ipzs[:5]])
     public_ans = f"Ho trovato riferimenti nel documento IPZS:\n\n{context}\n\n{ipzs_source_line()}"
     return public_ans, {
@@ -904,20 +979,28 @@ def answer_from_ipzs(user_q: str) -> Tuple[Optional[str], Dict[str, Any]]:
         "note": "Fallback su chunk IPZS",
     }
 
+
 if route in ["IPZS_SINGLE", "MIXED"]:
-    ipzs_ans, _ = answer_from_ipzs(user_input)
+    # Extra safety: se è in realtà CCNL (retribuzioni/straordinari), NON interrogare IPZS
+    if detect_route(user_input) == "CCNL":
+        ipzs_ans, ipzs_dbg = None, {"route": "IPZS_SKIPPED_FOR_CCNL"}
+    else:
+        ipzs_ans, ipzs_dbg = answer_from_ipzs(user_input)
+
     if ipzs_ans:
         assistant_payload = {
             "role": "assistant",
             "content": ipzs_ans,
             "citations": ipzs_source_line(),
             "question": user_input,
+            "debug": ipzs_dbg,
         }
         st.session_state.messages.append(assistant_payload)
         append_jsonl(LOGS_FILE, {"ts": now_iso(), "chat_id": st.session_state.chat_id, "event": "answer", "route": "IPZS"})
         st.rerun()
+
     if route != "MIXED":
-        assistant_payload = {"role": "assistant", "content": hard_not_found_generic(), "question": user_input}
+        assistant_payload = {"role": "assistant", "content": hard_not_found_generic(), "question": user_input, "debug": ipzs_dbg}
         st.session_state.messages.append(assistant_payload)
         st.rerun()
 
@@ -928,6 +1011,11 @@ if route in ["IPZS_SINGLE", "MIXED"]:
 selected_ccnl, best_ccnl, queries_ccnl, evidence_ccnl = retrieve_from_index(
     user_input, CCNL_VEC_PATH, CCNL_META_PATH, emb
 )
+
+# 🔥 filtro anti-permessi quando l'utente chiede straordinario/indennità/turni ecc.
+selected_ccnl = lexical_focus_filter(user_input, selected_ccnl)
+evidence_ccnl = extract_evidence(selected_ccnl, max_lines=MAX_EVIDENCE_LINES)
+
 retrieval_ok_ccnl = (best_ccnl >= MIN_BEST_SIMILARITY) and (len(selected_ccnl) >= MIN_SELECTED_CHUNKS)
 
 approved_dbg = None
@@ -938,17 +1026,30 @@ if have_approved:
     )
     if best_qa >= max(MIN_BEST_SIMILARITY, 0.28):
         selected_ccnl = dedup_by_text(selected_qa + selected_ccnl, max_out=TOP_K_FINAL)
+        selected_ccnl = lexical_focus_filter(user_input, selected_ccnl)
         evidence_ccnl = extract_evidence(selected_ccnl, max_lines=MAX_EVIDENCE_LINES)
         approved_dbg = {"best_qa": best_qa, "queries_qa": queries_qa, "evidence_qa": evidence_qa}
 
 if not retrieval_ok_ccnl:
-    assistant_payload = {"role": "assistant", "content": hard_not_found_ccnl(), "question": user_input}
+    assistant_payload = {
+        "role": "assistant",
+        "content": hard_not_found_ccnl(),
+        "question": user_input,
+        "debug": {
+            "route": "CCNL_BLOCKED",
+            "best_similarity": best_ccnl,
+            "queries": queries_ccnl,
+            "evidence": evidence_ccnl,
+            "selected": selected_ccnl[:6],
+        }
+    }
     st.session_state.messages.append(assistant_payload)
     append_jsonl(LOGS_FILE, {"ts": now_iso(), "chat_id": st.session_state.chat_id, "event": "answer", "route": "CCNL_BLOCKED"})
     st.rerun()
 
 pages = unique_pages_ccnl(selected_ccnl, max_pages=8)
 cit_line = format_ccnl_citations(pages)
+
 context = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected_ccnl])
 
 llm = get_llm()
@@ -967,8 +1068,7 @@ CONTESTO CCNL (estratti):
 {context}
 
 SCRIVI UNA RISPOSTA CHIARA E PRATICA.
-CHIUDI SEMPRE CON:
-{cit_line}
+CHIUDI SEMPRE CON: {cit_line}
 
 FORMATO:
 <PUBLIC>
@@ -983,6 +1083,7 @@ except Exception as e:
     raw = f"<PUBLIC>Errore nel generare la risposta: {e}\n\n{cit_line}</PUBLIC>"
 
 public_ans = split_public(raw).strip()
+
 if cit_line and ("fonte" not in public_ans.lower()):
     public_ans = public_ans.rstrip() + "\n\n" + cit_line
 
@@ -991,6 +1092,15 @@ assistant_payload = {
     "content": public_ans,
     "citations": cit_line,
     "question": user_input,
+    "debug": {
+        "route": "CCNL_OK",
+        "best_similarity": best_ccnl,
+        "queries": queries_ccnl,
+        "evidence": evidence_ccnl,
+        "pages_ccnl": pages,
+        "selected": selected_ccnl[:6],
+        "approved_dbg": approved_dbg,
+    },
 }
 
 st.session_state.messages.append(assistant_payload)
