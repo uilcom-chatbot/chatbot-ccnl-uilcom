@@ -1,15 +1,3 @@
-app.py — Assistente Contrattuale UILCOM IPZS (CCNL + IPZS Permessi)
-
-✅ Chat stile ChatGPT
-
-✅ Risposte CCNL con citazioni pagine
-
-✅ Risposte IPZS Permessi (RAO/ROL ecc) + elenco completo quando richiesto
-
-✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
-
-✅ Admin: reindicizza CCNL + Permessi + debug chunk/pagine usate
-
 import os
 import re
 import json
@@ -1890,4 +1878,5 @@ assistant_payload = {
 st.session_state.messages.append(assistant_payload)
 append_jsonl(LOGS_FILE, {"ts": now_iso(), "chat_id": st.session_state.chat_id, "event": "answer", "route": "CCNL_OK", "pages": pages})
 st.rerun()
+
 
