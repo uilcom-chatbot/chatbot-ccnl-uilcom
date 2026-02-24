@@ -1,12 +1,16 @@
 # app.py — Assistente Contrattuale UILCOM IPZS (CCNL + Indice IPZS Permessi)
-# ✅ Risposte SOLO dai documenti caricati:
-#    - CCNL (PDF)
-#    - IPZS Permessi (TXT da screenshot)
+# ✅ Risposte SOLO dai documenti caricati (CCNL PDF + IPZS Permessi TXT)
 # ✅ Pubblico: include SEMPRE citazioni (pagine/schede)
 # ✅ Admin: debug + evidenze + chunk/pagine usate
 # ✅ Topic reset: se cambia argomento, NON usa memoria breve (evita contaminazioni)
 # ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
 # ✅ Mansioni superiori: risposta deterministica (NO LLM) + pagine
+# ✅ Migliorie 2026-02:
+#    - Retrieval confidence più robusto (max + avg top3 + spread)
+#    - Limitazione duplicati per pagina/scheda + dedup chunk quasi identici
+#    - Multi-query più pulita (meno “rumore” in produzione)
+#    - Split IPZS schede più robusto (titoli + separatori + euristiche)
+#    - Prompt: in pubblico NON chiediamo tag <ADMIN> se non admin (riduce leakage)
 
 import os
 import json
@@ -55,16 +59,22 @@ IPZS_CHUNK_SIZE = 1000
 IPZS_CHUNK_OVERLAP = 120
 
 # Retrieval
-TOP_K_PER_QUERY = 12
+TOP_K_PER_QUERY = 10               # ⬅️ ridotto (meno rumore)
 TOP_K_FINAL = 18
-MAX_MULTI_QUERIES = 12
+MAX_MULTI_QUERIES = 8              # ⬅️ ridotto (meno rumore)
+
+# Dedup / diversity
+MAX_CHUNKS_PER_PAGE = 3            # max chunk per stessa pagina/scheda
+NEAR_DUP_JACCARD = 0.92            # se troppo simile, scarta
 
 # Memoria: usata SOLO se stesso argomento (topic)
 MEMORY_USER_TURNS = 3
 
-# Hard guardrail retrieval
-MIN_BEST_SIMILARITY = 0.24          # se max cosine < soglia => "non trovato"
-MIN_SELECTED_CHUNKS = 3             # se troppo pochi chunk => "non trovato"
+# Hard guardrail retrieval (più robusto)
+MIN_BEST_SIMILARITY = 0.245        # max cosine
+MIN_AVG_TOP3 = 0.220               # media top3 deve essere decente
+MIN_SPREAD = 0.020                 # max - median(top-k) per evitare “rumore piatto”
+MIN_SELECTED_CHUNKS = 3
 
 # Admin debug: quante righe evidenza mostrare
 MAX_EVIDENCE_LINES = 18
@@ -201,16 +211,69 @@ def format_public_citations(source: str, pages: List[int]) -> str:
     if not pages:
         return ""
     pages_sorted = sorted(pages)
-    # source: "CCNL" o "IPZS"
     if source == "IPZS":
         if len(pages_sorted) == 1:
             return f"**Fonte:** IPZS Permessi (scheda {pages_sorted[0]})"
         return f"**Fonte:** IPZS Permessi (schede {', '.join(map(str, pages_sorted))})"
-
-    # default CCNL
     if len(pages_sorted) == 1:
         return f"**Fonte:** CCNL (pag. {pages_sorted[0]})"
     return f"**Fonte:** CCNL (pagg. {', '.join(map(str, pages_sorted))})"
+
+
+def _tokenize_light(s: str) -> List[str]:
+    return re.findall(r"[a-zàèéìòù0-9]+", (s or "").lower())
+
+
+def _jaccard(a: List[str], b: List[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 1.0
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / max(1, len(sa | sb))
+
+
+def _dedup_near_identical(chunks: List[Dict[str, Any]], thr: float = NEAR_DUP_JACCARD) -> List[Dict[str, Any]]:
+    kept: List[Dict[str, Any]] = []
+    kept_tok: List[List[str]] = []
+
+    for c in chunks:
+        tok = _tokenize_light(c.get("text", ""))
+        is_dup = False
+        for kt in kept_tok:
+            if _jaccard(tok, kt) >= thr:
+                is_dup = True
+                break
+        if not is_dup:
+            kept.append(c)
+            kept_tok.append(tok)
+    return kept
+
+
+def _limit_per_page(chunks: List[Dict[str, Any]], max_per_page: int = MAX_CHUNKS_PER_PAGE) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cnt: Dict[Any, int] = {}
+    for c in chunks:
+        p = c.get("page", "?")
+        cnt[p] = cnt.get(p, 0) + 1
+        if cnt[p] <= max_per_page:
+            out.append(c)
+    return out
+
+
+def compute_retrieval_confidence(sim_values: List[float]) -> Dict[str, float]:
+    # sim_values: lista similarity dei chunk selezionati (ordinata desc)
+    if not sim_values:
+        return {"best": 0.0, "avg_top3": 0.0, "median": 0.0, "spread": 0.0}
+
+    best = float(sim_values[0])
+    top3 = sim_values[:3]
+    avg_top3 = float(sum(top3) / max(1, len(top3)))
+
+    med = float(np.median(np.array(sim_values, dtype=np.float32)))
+    spread = float(best - med)
+
+    return {"best": best, "avg_top3": avg_top3, "median": med, "spread": spread}
 
 
 # ============================================================
@@ -297,7 +360,6 @@ def is_lavoro_notturno_question(q: str) -> bool:
 
 def detect_topic(q: str) -> str:
     ql = q.lower()
-
     if is_malattia_question(ql):
         return "malattia"
     if is_mansioni_question(ql):
@@ -338,13 +400,14 @@ def build_enriched_question(current_q: str, current_topic: str) -> str:
 
 
 # ============================================================
-# QUERY BUILDER (multi-query)
+# QUERY BUILDER (multi-query) — meno rumore
 # ============================================================
 def build_queries(q: str) -> List[str]:
     q0 = q.strip()
     qlow = q0.lower()
 
-    qs = [q0, f"{q0} regole condizioni", f"{q0} definizione procedura"]
+    # Sempre: domanda + 1 riformulazione “leggera”
+    qs = [q0, f"{q0} CCNL regola"]  # ⬅️ tolte query troppo generiche
 
     user_is_rol = is_rol_exfest_question(q0)
     user_is_perm = is_permessi_question(q0)
@@ -354,42 +417,37 @@ def build_queries(q: str) -> List[str]:
     if user_is_rol:
         qs += [
             "RAO festività infrasettimanali abolite riposi retribuiti",
-            "ROL riduzione orario di lavoro monte ore annuo maturazione fruizione",
-            "riposo retribuito art.31 tre turni 24 ore 24",
-            "festività soppresse abolite riposi retribuiti quanti giorni",
+            "ROL riduzione orario di lavoro maturazione fruizione monte ore",
         ]
 
     if user_is_perm and (not user_is_rol):
         qs += [
             "permessi retribuiti tipologie elenco",
-            "permesso non retribuito una settimana l'anno",
             "permesso studio una settimana l'anno",
-            "donazione sangue permesso giornaliero retribuito",
-            "permessi elettorali presidente seggio scrutatore",
-            "congedo obbligatorio padre 10 giorni",
-            "legge 104 art 33 comma 3 permesso disabili grave",
+            "donazione sangue permesso retribuito",
+            "legge 104 art 33 comma 3 permesso",
         ]
 
     if user_is_mal:
         qs += [
-            "malattia trattamento economico percentuali integrazione",
+            "malattia trattamento economico integrazione",
             "malattia periodo di comporto conservazione posto",
-            "malattia visite fiscali reperibilità fasce orarie",
+            "malattia visite fiscali reperibilità fasce",
         ]
 
     if any(t in qlow for t in STRAORDINARI_TRIGGERS):
         qs += [
             "lavoro straordinario maggiorazioni limiti",
-            "straordinario notturno maggiorazione percentuale",
-            "lavoro notturno maggiorazione percentuale",
+            "straordinario notturno maggiorazione",
+            "lavoro notturno maggiorazione",
             "lavoro festivo maggiorazioni",
         ]
 
     if user_is_mans:
         qs += [
             "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
-            "assegnazione a mansioni superiori trattamento corrispondente",
-            "sostituzione lavoratore assente diritto conservazione del posto",
+            "mansioni superiori trattamento corrispondente",
+            "sostituzione lavoratore assente conservazione del posto",
         ]
 
     out, seen = [], set()
@@ -467,8 +525,8 @@ def _find_snippets(patterns: List[str], chunks: List[Dict[str, Any]], max_hits: 
 
 
 def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    patt_30 = [r"\b30\b.*giorn", r"trenta.*giorn"]
-    patt_60 = [r"\b60\b.*giorn", r"sessanta.*giorn"]
+    patt_30 = [r"\b30\b.*(giorn|gg)", r"trenta.*(giorn|gg)"]
+    patt_60 = [r"\b60\b.*(giorn|gg)", r"sessanta.*(giorn|gg)"]
     patt_consec = [r"consecutiv", r"continuativ"]
     patt_non_consec = [r"non\s+consecutiv", r"discontinu", r"non\s+continuativ"]
     patt_tratt = [r"trattamento\s+corrispondente", r"retribuzion.*corrispond", r"diritto\s+al\s+trattamento"]
@@ -476,8 +534,8 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     txt_all = " ".join([(c.get("text") or "").lower() for c in chunks])
 
-    found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
-    found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"giorn", txt_all) is not None
+    found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
+    found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
 
     has_trattamento = re.search(r"trattamento\s+corrispondente|diritto\s+al\s+trattamento|retribuzion.*corrispond", txt_all) is not None
     has_esclusione = re.search(r"sostituzion.*conservazion|diritto.*conservazion.*posto|non\s+.*applica", txt_all) is not None
@@ -583,7 +641,7 @@ def mansioni_admin_debug(rules: Dict[str, Any]) -> str:
 # ============================================================
 # SYSTEM RULES (core) — PUBBLICO CON CITAZIONI
 # ============================================================
-RULES = """
+RULES_PUBLIC = """
 Sei l’assistente UILCOM per lavoratori IPZS.
 Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto fornito (estratti dai documenti indicizzati).
 Non inventare informazioni.
@@ -598,50 +656,67 @@ REGOLE IMPORTANTI:
      spiega che la dicitura è quella (equivalente all’uso comune).
 4) Permessi:
    - Elenca SOLO le tipologie che trovi nel contesto.
-5) PUBBLICO: devi SEMPRE includere una riga finale con la fonte:
+5) Devi SEMPRE includere una riga finale con la fonte:
    - "Fonte: CCNL (pag. ...)" oppure "Fonte: IPZS Permessi (scheda ...)".
-6) MALATTIA:
-   - Se la domanda riguarda la malattia, includi se presenti nel contesto:
-     • trattamento economico
-     • periodo di comporto
-     • eventuali regole di reperibilità/visite fiscali
-   - Se alcune informazioni non sono nel contesto recuperato, non inventarle.
 
-FORMATO OUTPUT OBBLIGATORIO:
+FORMATO:
+Risposta diretta e verificabile. Niente sezioni tecniche.
+"""
 
-<PUBLIC>
-...testo per l’utente...
-(Fonte: ... )
-</PUBLIC>
-
-<ADMIN>
-- Evidenze: ...
-- Pagine/chunk usati: ...
-</ADMIN>
+RULES_ADMIN = """
+ADMIN MODE:
+- Riassumi in bullet cosa hai usato per rispondere
+- Elenca 3–8 evidenze con (pag./scheda X)
+- Indica pagine/schede usate
 """
 
 
 # ============================================================
-# IPZS TXT SPLIT (schede)
+# IPZS TXT SPLIT (schede) — più robusto
 # ============================================================
 def split_ipzs_blocks(raw_txt: str) -> List[str]:
-    txt = raw_txt.replace("\r\n", "\n")
+    """
+    Obiettivo: ottenere “schede” coerenti anche se il testo arriva da screenshot/estrazioni miste.
+
+    Strategie:
+    1) separatori espliciti (righe di --- / === / ***)
+    2) titoli (maiuscolo “forte”) seguiti da riga vuota o contenuto lungo
+    3) fallback: tutto in una scheda
+    """
+    txt = (raw_txt or "").replace("\r\n", "\n")
     lines = txt.split("\n")
 
+    # 1) split per separatori lunghi
+    sep_idx = [i for i, ln in enumerate(lines) if re.fullmatch(r"[\-\=\*]{5,}", ln.strip() or "") is not None]
+    if len(sep_idx) >= 1:
+        blocks = []
+        start = 0
+        for i in sep_idx:
+            block = "\n".join(lines[start:i]).strip()
+            if len(block) >= 120:
+                blocks.append(block)
+            start = i + 1
+        tail = "\n".join(lines[start:]).strip()
+        if len(tail) >= 120:
+            blocks.append(tail)
+        if blocks:
+            return blocks
+
+    # 2) split per titoli “forti”
     starts = []
     for i, ln in enumerate(lines):
-        s = ln.strip()
+        s = (ln or "").strip()
         if not s:
             continue
-
-        # Titolo “tipo schermata”: tutto maiuscolo + numeri / simboli comuni
-        is_title = (
-            len(s) >= 4 and len(s) <= 80
-            and re.fullmatch(r"[A-Z0-9\.\-\/\(\)\s]+", s) is not None
-        )
-
-        if is_title:
-            starts.append(i)
+        # titolo: parecchie lettere maiuscole, pochi caratteri strani
+        if 4 <= len(s) <= 90 and re.fullmatch(r"[A-Z0-9ÀÈÉÌÒÙ\.\-\/\(\)\s]+", s) is not None:
+            # euristica: riga successiva vuota oppure riga successiva “non titolo”
+            nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+            nxt2 = lines[i + 2].strip() if i + 2 < len(lines) else ""
+            cond = (nxt == "") or (nxt and re.fullmatch(r"[A-Z0-9ÀÈÉÌÒÙ\.\-\/\(\)\s]+", nxt) is None)
+            cond = cond or (nxt == "" and nxt2 != "")
+            if cond:
+                starts.append(i)
 
     if len(starts) >= 2:
         blocks = []
@@ -649,7 +724,7 @@ def split_ipzs_blocks(raw_txt: str) -> List[str]:
             a = starts[k]
             b = starts[k + 1] if k + 1 < len(starts) else len(lines)
             block = "\n".join(lines[a:b]).strip()
-            if len(block) >= 80:
+            if len(block) >= 120:
                 blocks.append(block)
         if blocks:
             return blocks
@@ -790,6 +865,7 @@ if "messages" not in st.session_state:
 if "last_topic" not in st.session_state:
     st.session_state.last_topic = None
 
+
 # Render chat history
 for m in st.session_state.messages:
     with st.chat_message(m["role"]):
@@ -804,7 +880,8 @@ for m in st.session_state.messages:
                     st.code(dbg.get("enriched_q", ""))
                     st.write("**Query usate:**")
                     st.code("\n".join(dbg.get("queries", [])))
-                    st.write("**Best similarity:**", dbg.get("best_similarity", None))
+                    st.write("**Confidence:**")
+                    st.json(dbg.get("confidence", {}))
                     st.write("**Evidenze estratte:**")
                     st.code("\n".join(dbg.get("evidence", [])) or "(nessuna)")
                     if dbg.get("mansioni_guardrail"):
@@ -825,6 +902,7 @@ if not user_input:
 
 # Append user msg
 st.session_state.messages.append({"role": "user", "content": user_input})
+
 
 # ============================================================
 # SCEGLI SORGENTE: CCNL o IPZS (permessi/ROL/RAO)
@@ -851,8 +929,9 @@ else:
         })
         st.rerun()
 
+
 # ============================================================
-# RETRIEVAL PIPELINE (con topic reset)
+# RETRIEVAL PIPELINE (robusta + dedup + diversity)
 # ============================================================
 if source == "CCNL":
     vectors, meta = load_index(VEC_PATH, META_PATH)
@@ -879,10 +958,49 @@ for q in queries:
         if (int(i) not in scores_best) or (s > scores_best[int(i)]):
             scores_best[int(i)] = s
 
-final_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)[:TOP_K_FINAL]
-selected = [meta[i] for i in final_idx]
+# Ordina per score (desc)
+ranked_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)
 
-# Optional BM25 rerank
+# Crea candidati con score (per calcolare confidence)
+candidates: List[Dict[str, Any]] = []
+cand_scores: List[float] = []
+for i in ranked_idx[: max(TOP_K_FINAL * 3, TOP_K_FINAL) ]:  # oversampling per dedup
+    candidates.append(meta[int(i)])
+    cand_scores.append(float(scores_best[int(i)]))
+
+# Applica diversity: limite per pagina/scheda
+# (manteniamo l'ordine per score)
+tmp: List[Dict[str, Any]] = []
+tmp_scores: List[float] = []
+per_page: Dict[Any, int] = {}
+for c, s in zip(candidates, cand_scores):
+    p = c.get("page", "?")
+    per_page[p] = per_page.get(p, 0) + 1
+    if per_page[p] <= MAX_CHUNKS_PER_PAGE:
+        tmp.append(c)
+        tmp_scores.append(s)
+    if len(tmp) >= TOP_K_FINAL:
+        break
+
+selected = tmp[:TOP_K_FINAL]
+selected_scores = tmp_scores[:TOP_K_FINAL]
+
+# Dedup quasi identici (potrebbe ridurre sotto TOP_K_FINAL)
+selected = _dedup_near_identical(selected, thr=NEAR_DUP_JACCARD)
+# Ricalcola scores “allineati” in modo semplice (ri-deriva dalla mappa)
+selected_scores = []
+for c in selected:
+    # trova un idx coerente? qui usiamo la migliore similarity tra i candidati
+    # fallback: 0.0 se non trovata
+    best_s = 0.0
+    for idx, sc in scores_best.items():
+        if meta[idx] is c:
+            best_s = sc
+            break
+    # se non trovato (normalmente sì), lasciamo 0.0
+    selected_scores.append(float(best_s))
+
+# Optional BM25 rerank (su contenuti già filtrati)
 selected = bm25_rerank(enriched_q, selected)
 
 # Evidence + citations
@@ -890,8 +1008,14 @@ key_evidence = extract_key_evidence(selected, source)
 public_pages = unique_pages(selected, max_pages=8)
 public_cit_line = format_public_citations(source, public_pages)
 
-# Hard guardrail retrieval
-retrieval_ok = (best_similarity >= MIN_BEST_SIMILARITY) and (len(selected) >= MIN_SELECTED_CHUNKS)
+confidence = compute_retrieval_confidence(selected_scores)
+
+retrieval_ok = (
+    confidence["best"] >= MIN_BEST_SIMILARITY
+    and confidence["avg_top3"] >= MIN_AVG_TOP3
+    and confidence["spread"] >= MIN_SPREAD
+    and len(selected) >= MIN_SELECTED_CHUNKS
+)
 
 def hard_not_found_message() -> str:
     return "Non ho trovato la risposta nei documenti caricati."
@@ -924,7 +1048,7 @@ if topic == "mansioni":
             "queries": queries,
             "evidence": key_evidence,
             "selected": selected,
-            "best_similarity": best_similarity,
+            "confidence": confidence,
             "mansioni_guardrail": mansioni_admin_debug(extract_mansioni_rules(selected)) if retrieval_ok else "(retrieval debole)",
             "bm25_available": BM25_AVAILABLE,
         }
@@ -947,7 +1071,7 @@ if not retrieval_ok:
             "queries": queries,
             "evidence": key_evidence,
             "selected": selected,
-            "best_similarity": best_similarity,
+            "confidence": confidence,
             "bm25_available": BM25_AVAILABLE,
             "note": "retrieval_ok=False -> risposta bloccata",
         }
@@ -955,7 +1079,10 @@ if not retrieval_ok:
     st.session_state.messages.append(assistant_payload)
     st.rerun()
 
-context = "\n\n---\n\n".join([f"[{'Scheda' if source=='IPZS' else 'Pagina'} {c.get('page','?')}] {c.get('text','')}" for c in selected])
+
+context = "\n\n---\n\n".join(
+    [f"[{'Scheda' if source=='IPZS' else 'Pagina'} {c.get('page','?')}] {c.get('text','')}" for c in selected]
+)
 evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
 
 guardrail_notturno = ""
@@ -970,8 +1097,9 @@ elif is_straordinario_notturno_question(enriched_q):
 
 llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
 
-prompt = f"""
-{RULES}
+# Prompt “pulito” per PUBLIC (sempre)
+prompt_public = f"""
+{RULES_PUBLIC}
 
 SORGENTE ATTIVA: {source}
 {guardrail_notturno}
@@ -989,45 +1117,58 @@ CONTESTO (estratti indicizzati):
 {context}
 
 RICORDA:
-- Nel PUBLIC: risposta pulita MA con citazione finale coerente con la sorgente:
-  • CCNL -> "Fonte: CCNL (pag. ...)"
-  • IPZS -> "Fonte: IPZS Permessi (scheda ...)"
-- Nel ADMIN: inserisci elenco pagine/schede trovate e righe evidenza importanti con (pag./scheda X).
+- Chiudi SEMPRE con una riga "Fonte: ..." coerente con la sorgente.
 """
 
-def split_public_admin(text: str) -> Tuple[str, str]:
-    pub = ""
-    adm = ""
-    m_pub = re.search(r"<PUBLIC>(.*?)</PUBLIC>", text, flags=re.DOTALL | re.IGNORECASE)
-    m_adm = re.search(r"<ADMIN>(.*?)</ADMIN>", text, flags=re.DOTALL | re.IGNORECASE)
-    if m_pub:
-        pub = m_pub.group(1).strip()
-    else:
-        pub = text.strip()
-    if m_adm:
-        adm = m_adm.group(1).strip()
-    return pub, adm
+# Prompt separato per ADMIN (solo se admin)
+prompt_admin = f"""
+{RULES_PUBLIC}
 
+{RULES_ADMIN}
+
+SORGENTE ATTIVA: {source}
+TOPIC: {topic}
+
+DOMANDA (UTENTE):
+{user_input}
+
+EVIDENZE:
+{evidence_block}
+
+PAGINE/SCHEDA CANDIDATE (ordine di rilevanza):
+{format_public_citations(source, unique_pages(selected, max_pages=12))}
+
+CONTESTO (estratti indicizzati):
+{context}
+
+OUTPUT:
+- Bullet list breve
+"""
+
+def ensure_source_line(public_text: str, fallback_source_line: str) -> str:
+    if not public_text:
+        return hard_not_found_message()
+    has_source = bool(re.search(r"\bfonte\b\s*:", public_text, flags=re.IGNORECASE))
+    if (not has_source) and fallback_source_line:
+        return public_text.rstrip() + "\n\n" + fallback_source_line
+    return public_text
+
+
+admin_text = ""
 try:
-    raw = llm.invoke(prompt).content
+    public_raw = llm.invoke(prompt_public).content
 except Exception as e:
-    raw = f"<PUBLIC>Errore nel generare la risposta: {e}</PUBLIC><ADMIN></ADMIN>"
+    public_raw = f"Errore nel generare la risposta: {e}"
 
-public_ans, admin_ans = split_public_admin(raw)
-public_ans = (public_ans or "").strip()
+if st.session_state.is_admin:
+    try:
+        admin_text = llm.invoke(prompt_admin).content
+    except Exception:
+        admin_text = ""
 
-# Post-guardrail: se modello “dimentica” la fonte, la aggiungiamo noi (solo se abbiamo pagine)
-if public_ans:
-    has_source = bool(re.search(r"\bfonte\b\s*:", public_ans, flags=re.IGNORECASE))
-    if (not has_source) and public_cit_line:
-        public_ans = public_ans.rstrip() + "\n\n" + public_cit_line
-else:
-    public_ans = hard_not_found_message()
+public_ans = ensure_source_line((public_raw or "").strip(), public_cit_line)
 
-assistant_payload: Dict[str, Any] = {
-    "role": "assistant",
-    "content": public_ans,
-}
+assistant_payload: Dict[str, Any] = {"role": "assistant", "content": public_ans}
 
 if st.session_state.is_admin:
     assistant_payload["debug"] = {
@@ -1037,12 +1178,11 @@ if st.session_state.is_admin:
         "queries": queries,
         "evidence": key_evidence,
         "selected": selected,
-        "best_similarity": best_similarity,
-        "admin_llm_section": admin_ans,
+        "confidence": confidence,
+        "admin_llm_section": admin_text,
         "bm25_available": BM25_AVAILABLE,
     }
 
 st.session_state.last_topic = topic
 st.session_state.messages.append(assistant_payload)
 st.rerun()
-
