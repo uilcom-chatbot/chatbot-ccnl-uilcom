@@ -326,7 +326,7 @@ MALATTIA_TRIGGERS = [
 
 STRAORDINARI_TRIGGERS = [
     "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
-    "notturno", "festivo", "feriale",
+    "festivo", "feriale",
 ]
 
 
@@ -365,6 +365,12 @@ def is_lavoro_notturno_question(q: str) -> bool:
     return ("notturn" in ql) and ("straordin" not in ql)
 
 
+def is_notturno_ordinario_question(q: str) -> bool:
+    ql = q.lower()
+    # NOTTURNO ORDINARIO: parla di notturno ma NON di straordinario
+    return ("notturn" in ql) and ("straordin" not in ql)
+
+
 def detect_topic(q: str) -> str:
     ql = q.lower()
     if is_malattia_question(ql):
@@ -375,6 +381,9 @@ def detect_topic(q: str) -> str:
         return "rol_exfest"
     if is_permessi_question(ql):
         return "permessi"
+    # ✅ prima intercettiamo il notturno ordinario
+    if is_notturno_ordinario_question(ql):
+        return "notturno_ordinario"
     if is_straordinario_question(ql):
         return "straordinari"
     return "altro"
@@ -435,6 +444,12 @@ def build_queries(q: str) -> List[str]:
             "straordinario notturno maggiorazione 60",
             "straordinario festivo maggiorazione 60",
             "straordinario grafici editoria maggiorazione 35 60",
+        ]
+    if is_notturno_ordinario_question(q0):
+        qs += [
+            "lavoro notturno ordinario maggiorazione percentuale",
+            "lavoro notturno turni maggiorazione CCNL grafici",
+            "indennità o maggiorazione lavoro notturno (non straordinario)",
         ]
     if is_mansioni_question(q0):
         qs += [
@@ -1021,6 +1036,55 @@ if topic == "straordinari":
     st.rerun()
 
 
+if topic == "notturno_ordinario":
+    if source != "CCNL":
+        st.session_state.messages.append({"role": "assistant", "content": "Per il **lavoro notturno ordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
+        st.rerun()
+
+    if not retrieval_ok:
+        payload = {"role": "assistant", "content": "Non ho trovato nel CCNL caricato la percentuale del **lavoro notturno ordinario** (nel materiale recuperato).\n\n" + format_public_citations("CCNL", public_pages)}
+        st.session_state.last_topic = topic
+        st.session_state.messages.append(payload)
+        st.rerun()
+
+    # LLM con guardrail forte: percentuali SOLO se presenti nel contesto
+    context_local = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
+
+    llm_local = ChatOpenAI(model=LLM_MODEL, temperature=0, api_key=OPENAI_API_KEY)
+
+    prompt_notturno = f"""
+Rispondi in italiano chiaro e sindacale.
+Devi parlare SOLO di **lavoro notturno ordinario** (NON straordinario).
+Usa SOLO il contesto fornito.
+Se nel contesto NON c’è una percentuale esplicita, scrivi: "Non ho trovato nel CCNL caricato la percentuale del lavoro notturno ordinario."
+
+DIVIETI:
+- Non usare 35/60/60 (sono dello straordinario).
+- Non citare 40/80 (Parte Sesta).
+- Non confondere con straordinario.
+
+DOMANDA: {user_input}
+
+CONTESTO CCNL:
+{context_local}
+
+Chiudi con: {format_public_citations("CCNL", public_pages)}
+"""
+    try:
+        ans = llm_local.invoke(prompt_notturno).content
+    except Exception as e:
+        ans = f"Errore nel generare la risposta: {e}"
+
+    if not re.search(r"\bfonte\b\s*:", ans or "", flags=re.IGNORECASE):
+        ans = (ans or "").strip() + "\n\n" + format_public_citations("CCNL", public_pages)
+
+    payload = {"role": "assistant", "content": (ans or "").strip()}
+    if st.session_state.is_admin:
+        payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence, "evidence": key_evidence}
+
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
 
 
 if topic == "permessi":
@@ -1049,32 +1113,6 @@ if topic == "permessi":
         st.session_state.messages.append(payload)
         st.rerun()
 
-
-# ============================================================
-# GUARDRAIL: STRAORDINARIO CCNL GRAFICI (IPZS)
-# ============================================================
-if topic == "straordinari":
-
-    public_ans = (
-        "Nel settore grafico (IPZS) il lavoro straordinario è compensato con le seguenti maggiorazioni:\n\n"
-        "- **Straordinario diurno:** 35%\n"
-        "- **Straordinario notturno:** 60%\n"
-        "- **Straordinario festivo:** 60%\n\n"
-        "Le percentuali del 40% e 80% previste dal CCNL riguardano esclusivamente la Parte Sesta "
-        "(aziende editrici e stampatrici di giornali quotidiani e periodici)."
-    )
-
-    payload = {"role": "assistant", "content": public_ans}
-
-    if st.session_state.is_admin:
-        payload["debug"] = {
-            "topic": topic,
-            "deterministic_straordinari": True
-        }
-
-    st.session_state.last_topic = topic
-    st.session_state.messages.append(payload)
-    st.rerun()
 
 # ============================================================
 # LLM per gli altri topic
@@ -1133,4 +1171,5 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
+
 
