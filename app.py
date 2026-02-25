@@ -623,6 +623,51 @@ def straordinari_ipzs_public_answer(user_q: str, cc_pages: List[int]) -> str:
     return "\n".join(lines).strip()
 
 
+
+
+# ============================================================
+# GUARDRAIL: ROL / RAO / EX FESTIVITÀ (deterministico – evita confusioni con Legge 104)
+# ============================================================
+def rol_exfest_ipzs_public_answer(user_q: str, ipzs_pages: List[int]) -> str:
+    ql = (user_q or "").lower()
+
+    lines: List[str] = []
+
+    # RAO
+    if "rao" in ql or "r.a.o" in ql or "riposo annuo" in ql or "riposi annui" in ql:
+        lines.append(
+            "I **RAO** (riposi annui) sono ore/giornate di permesso retribuito previste dalle regole aziendali IPZS. "
+            "Per sapere **quante ore maturi** e **come si richiedono**, fai riferimento alla scheda IPZS dedicata (procedura presenze/portale)."
+        )
+
+    # EX FESTIVITÀ
+    if ("ex festiv" in ql) or ("ex-festiv" in ql) or ("exfestiv" in ql) or ("festività soppresse" in ql) or ("festivita soppresse" in ql) or ("festività abolite" in ql) or ("festivita abolite" in ql) or ("infrasettimanali abolite" in ql):
+        lines.append(
+            "Le **ex festività** (spesso indicate anche come *festività soppresse/abolite* o *infrasettimanali abolite*) "
+            "sono permessi/recuperi riconosciuti secondo le regole IPZS. La fruizione avviene con le modalità indicate nella scheda IPZS."
+        )
+
+    # ROL (default se non RAO/EXFEST o se è presente 'rol')
+    if ("rol" in ql) or ("r.o.l" in ql) or (not lines):
+        lines.append(
+            "I **ROL** (Riduzione Orario di Lavoro) sono permessi retribuiti che maturano nel tempo e permettono di assentarsi dal lavoro "
+            "mantenendo la retribuzione. **Non vanno confusi** con i permessi della **Legge 104** (che sono un istituto diverso).
+
+"
+            "Per **maturazione**, **residuo** e **modalità di richiesta** fai riferimento alla scheda IPZS ROL/RAO e alla procedura presenze."
+        )
+
+    cit = format_public_citations("IPZS", ipzs_pages or [])
+    if cit:
+        lines.append(cit)
+    else:
+        lines.append("**Fonte:** IPZS Permessi")
+
+    return "
+
+".join(lines).strip()
+
+
 # ============================================================
 # SYSTEM RULES (LLM) — tono più “sindacale”
 # ============================================================
@@ -959,6 +1004,31 @@ if topic == "straordinari":
             "confidence": confidence,
             "evidence": key_evidence,
             "filtered_parte_sesta": True,
+        }
+
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+
+
+
+if topic == "rol_exfest":
+    if source != "IPZS":
+        st.session_state.messages.append({"role": "assistant", "content": "Per **ROL/RAO/ex festività** consulto le **schede IPZS (permessi)**. Indicizza IPZS e riprova."})
+        st.rerun()
+
+    # ✅ deterministico: evita allucinazioni (es. confusione con permessi 104)
+    public_ans = rol_exfest_ipzs_public_answer(user_input, public_pages)
+
+    payload = {"role": "assistant", "content": public_ans}
+    if st.session_state.is_admin:
+        payload["debug"] = {
+            "topic": topic,
+            "queries": queries,
+            "confidence": confidence,
+            "evidence": key_evidence,
+            "deterministic_rol_rao": True,
         }
 
     st.session_state.last_topic = topic
