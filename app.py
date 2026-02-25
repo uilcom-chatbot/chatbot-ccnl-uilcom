@@ -106,12 +106,9 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
 st.title(APP_TITLE)
 st.markdown(
-    "**Accesso riservato agli iscritti UILCOM**  
-"
-    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  
-"
-    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  
-"
+    "**Accesso riservato agli iscritti UILCOM**  "
+    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  "
+    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  "
     "Per casi complessi o contestazioni, contatta RSU/UILCOM."
 )
 st.divider()
@@ -1020,3 +1017,4 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
+
