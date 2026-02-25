@@ -5,14 +5,11 @@
 # ✅ Topic reset: se cambia argomento, NON usa memoria breve (evita contaminazioni)
 # ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
 # ✅ Mansioni superiori: risposta deterministica (NO LLM) + pagine
-# ✅ Migliorie 2026-02 (rev2):
-#    - Retrieval confidence più robusto (max + avg top3 + spread)
-#    - Limitazione duplicati per pagina/scheda + dedup chunk quasi identici
-#    - Multi-query più pulita (meno “rumore” in produzione)
-#    - Split IPZS schede più robusto (titoli + separatori + euristiche)
-#    - Prompt: in pubblico NON chiediamo tag <ADMIN> se non admin (riduce leakage)
-#    - Mansioni superiori: matching robusto su apostrofi tipografici + query “chiave”
-#    - Mansioni superiori: fallback retrieval mirato se manca “trattamento corrispondente”
+# ✅ Migliorie 2026-02 (rev3):
+#    - Matching robusto apostrofi tipografici (’)
+#    - Query “chiave” per mansioni superiori
+#    - Fallback retrieval mirato se manca “trattamento corrispondente”
+#    - Eccezione “sostituzione/conservazione del posto” mostrata SOLO se l’utente chiede passaggio livello/definitività (30/60)
 
 import os
 import json
@@ -47,7 +44,6 @@ VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
 META_PATH = os.path.join(INDEX_DIR, "chunks.json")
 
 # IPZS Permessi (TXT da screenshot)
-# 👉 metti in /documenti/ questo file: PERMESSI_IPZS_COMPLETO_FINALE.txt
 IPZS_TXT_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
 INDEX_DIR_IPZS = "index_ipzs_permessi"
 VEC_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "vectors.npy")
@@ -61,24 +57,24 @@ IPZS_CHUNK_SIZE = 1000
 IPZS_CHUNK_OVERLAP = 120
 
 # Retrieval
-TOP_K_PER_QUERY = 10               # ⬅️ ridotto (meno rumore)
+TOP_K_PER_QUERY = 10
 TOP_K_FINAL = 18
-MAX_MULTI_QUERIES = 8              # ⬅️ ridotto (meno rumore)
+MAX_MULTI_QUERIES = 8
 
 # Dedup / diversity
-MAX_CHUNKS_PER_PAGE = 3            # max chunk per stessa pagina/scheda
-NEAR_DUP_JACCARD = 0.92            # se troppo simile, scarta
+MAX_CHUNKS_PER_PAGE = 3
+NEAR_DUP_JACCARD = 0.92
 
 # Memoria: usata SOLO se stesso argomento (topic)
 MEMORY_USER_TURNS = 3
 
-# Hard guardrail retrieval (più robusto)
-MIN_BEST_SIMILARITY = 0.245        # max cosine
-MIN_AVG_TOP3 = 0.220               # media top3 deve essere decente
-MIN_SPREAD = 0.020                 # max - median(top-k) per evitare “rumore piatto”
+# Hard guardrail retrieval
+MIN_BEST_SIMILARITY = 0.245
+MIN_AVG_TOP3 = 0.220
+MIN_SPREAD = 0.020
 MIN_SELECTED_CHUNKS = 3
 
-# Admin debug: quante righe evidenza mostrare
+# Admin debug
 MAX_EVIDENCE_LINES = 18
 
 # LLM
@@ -90,23 +86,17 @@ LLM_TEMPERATURE = 0
 # SECRETS / PASSWORDS
 # ============================================================
 def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
-    # Streamlit Cloud: st.secrets
     try:
         if key in st.secrets:  # type: ignore
             return str(st.secrets[key])  # type: ignore
     except Exception:
         pass
-    # Env
     return os.getenv(key, default)
 
 
-def sha256_text(s: str) -> str:
-    return hashlib.sha256(s.encode("utf-8")).hexdigest()
-
-
-UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")        # password iscritti
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")          # password admin debug
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")          # obbligatoria
+UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")
+ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 
 
 # ============================================================
@@ -168,12 +158,11 @@ if not OPENAI_API_KEY:
 
 
 # ============================================================
-# TEXT NORMALIZATION (important for matching apostrophes etc.)
+# TEXT NORMALIZATION (apostrophes etc.)
 # ============================================================
 def normalize_text_for_match(s: str) -> str:
     if not s:
         return ""
-    # uniforma apostrofi e spazi
     s = s.replace("’", "'").replace("“", '"').replace("”", '"')
     s = re.sub(r"\s+", " ", s)
     return s.lower()
@@ -250,17 +239,12 @@ def _jaccard(a: List[str], b: List[str]) -> float:
 def _dedup_near_identical(chunks: List[Dict[str, Any]], thr: float = NEAR_DUP_JACCARD) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
     kept_tok: List[List[str]] = []
-
     for c in chunks:
         tok = _tokenize_light(c.get("text", ""))
-        is_dup = False
-        for kt in kept_tok:
-            if _jaccard(tok, kt) >= thr:
-                is_dup = True
-                break
-        if not is_dup:
-            kept.append(c)
-            kept_tok.append(tok)
+        if any(_jaccard(tok, kt) >= thr for kt in kept_tok):
+            continue
+        kept.append(c)
+        kept_tok.append(tok)
     return kept
 
 
@@ -276,13 +260,287 @@ def _limit_per_page(chunks: List[Dict[str, Any]], max_per_page: int = MAX_CHUNKS
 
 
 def compute_retrieval_confidence(sim_values: List[float]) -> Dict[str, float]:
-    # sim_values: lista similarity dei chunk selezionati (ordinata desc)
     if not sim_values:
         return {"best": 0.0, "avg_top3": 0.0, "median": 0.0, "spread": 0.0}
-
     best = float(sim_values[0])
     top3 = sim_values[:3]
     avg_top3 = float(sum(top3) / max(1, len(top3)))
+    med = float(np.median(np.array(sim_values, dtype=np.float32)))
+    spread = float(best - med)
+    return {"best": best, "avg_top3": avg_top3, "median": med, "spread": spread}
+
+
+# ============================================================
+# TRIGGERS / TOPIC
+# ============================================================
+MANSIONI_TRIGGERS = [
+    "mansioni superiori", "mansione superiore", "mansioni più alte", "mansioni piu alte",
+    "categoria superiore", "livello superiore", "passaggio di categoria", "cambio categoria",
+    "inquadramento superiore", "posto vacante", "sostituzione", "sto sostituendo",
+    "differenza paga", "differenza di paga", "pagato di più", "pagato di piu",
+    "trattamento corrispondente", "retribuzione corrispondente",
+]
+PERMESSI_TRIGGERS = [
+    "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
+    "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami", "formazione",
+    "104", "assemblea", "sindac", "donazione", "rol", "ex festiv", "festività soppresse", "festivita soppresse",
+    "festività abolite", "festivita abolite",
+]
+ROL_EXFEST_TRIGGERS = [
+    "rol", "r.o.l", "riduzione orario",
+    "ex festiv", "ex-festiv", "exfestiv",
+    "festività soppresse", "festivita soppresse",
+    "festività abolite", "festivita abolite",
+    "festività infrasettimanali", "festivita infrasettimanali",
+    "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
+]
+MALATTIA_TRIGGERS = [
+    "malattia", "certificato", "certificat", "inps",
+    "comporto", "prognosi", "ricaduta",
+    "visita fiscale", "reperibil", "fasce",
+    "ricovero", "day hospital",
+    "infortunio",
+]
+STRAORDINARI_TRIGGERS = [
+    "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
+    "notturno", "festivo", "supplementare"
+]
+
+
+def is_mansioni_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in MANSIONI_TRIGGERS)
+
+
+def is_permessi_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in PERMESSI_TRIGGERS)
+
+
+def is_rol_exfest_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in ROL_EXFEST_TRIGGERS)
+
+
+def is_malattia_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in MALATTIA_TRIGGERS)
+
+
+def is_straordinario_notturno_question(q: str) -> bool:
+    ql = q.lower()
+    return ("straordin" in ql) and ("notturn" in ql)
+
+
+def is_lavoro_notturno_question(q: str) -> bool:
+    ql = q.lower()
+    return ("notturn" in ql) and ("straordin" not in ql)
+
+
+def detect_topic(q: str) -> str:
+    ql = q.lower()
+    if is_malattia_question(ql):
+        return "malattia"
+    if is_mansioni_question(ql):
+        return "mansioni"
+    if is_rol_exfest_question(ql):
+        return "rol_exfest"
+    if is_permessi_question(ql):
+        return "permessi"
+    if any(t in ql for t in STRAORDINARI_TRIGGERS):
+        return "straordinari_notturno_festivo"
+    return "altro"
+
+
+# ============================================================
+# MEMORIA BREVE (solo stesso topic)
+# ============================================================
+def build_enriched_question(current_q: str, current_topic: str) -> str:
+    if "messages" not in st.session_state:
+        return current_q.strip()
+    last_topic = st.session_state.get("last_topic", None)
+    if last_topic and last_topic != current_topic:
+        return current_q.strip()
+    user_msgs = [m["content"] for m in st.session_state.messages if m.get("role") == "user" and m.get("content")]
+    prev = user_msgs[:-1] if (user_msgs and user_msgs[-1].strip() == current_q.strip()) else user_msgs
+    last = prev[-MEMORY_USER_TURNS:] if prev else []
+    last = [x.strip() for x in last if x.strip()]
+    if not last:
+        return current_q.strip()
+    return (
+        "CONTESTO CONVERSAZIONE (ultime richieste utente, stesso argomento):\n"
+        + "\n".join([f"- {x}" for x in last])
+        + "\n\nDOMANDA ATTUALE:\n"
+        + current_q.strip()
+    )
+
+
+# ============================================================
+# QUERY BUILDER
+# ============================================================
+def build_queries(q: str) -> List[str]:
+    q0 = q.strip()
+    qlow = q0.lower()
+    qs = [q0, f"{q0} CCNL regola"]
+
+    user_is_rol = is_rol_exfest_question(q0)
+    user_is_perm = is_permessi_question(q0)
+    user_is_mal = is_malattia_question(q0)
+    user_is_mans = is_mansioni_question(q0)
+
+    if user_is_rol:
+        qs += [
+            "RAO festività infrasettimanali abolite riposi retribuiti",
+            "ROL riduzione orario di lavoro maturazione fruizione monte ore",
+        ]
+    if user_is_perm and (not user_is_rol):
+        qs += [
+            "permessi retribuiti tipologie elenco",
+            "permesso studio una settimana l'anno",
+            "donazione sangue permesso retribuito",
+            "legge 104 art 33 comma 3 permesso",
+        ]
+    if user_is_mal:
+        qs += [
+            "malattia trattamento economico integrazione",
+            "malattia periodo di comporto conservazione posto",
+            "malattia visite fiscali reperibilità fasce",
+        ]
+    if any(t in qlow for t in STRAORDINARI_TRIGGERS):
+        qs += [
+            "lavoro straordinario maggiorazioni limiti",
+            "straordinario notturno maggiorazione",
+            "lavoro notturno maggiorazione",
+            "lavoro festivo maggiorazioni",
+        ]
+    if user_is_mans:
+        qs += [
+            "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
+            "mansioni superiori trattamento corrispondente all'attività svolta",
+            "sostituzione lavoratore assente conservazione del posto",
+            "ha diritto al trattamento corrispondente all’attività svolta 30 giorni 60 giorni non si applica sostituzione conservazione del posto",
+        ]
+
+    out, seen = [], set()
+    for x in qs:
+        x = x.strip()
+        if x and x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out[:MAX_MULTI_QUERIES]
+
+
+# ============================================================
+# EVIDENCE EXTRACTION
+# ============================================================
+def extract_key_evidence(chunks: List[Dict[str, Any]], source: str) -> List[str]:
+    patterns = [
+        r"\b30\b", r"\b60\b", r"mansioni?\s+superiori?",
+        r"sostituzion", r"conservazion.*posto",
+        r"ha\s+diritto\s+al\s+trattamento", r"trattamento\s+corrispondente",
+        r"\brao\b", r"\brol\b",
+    ]
+    evidences: List[str] = []
+    for c in chunks:
+        page = c.get("page", "?")
+        text = c.get("text", "") or ""
+        for ln in [x.strip() for x in text.splitlines() if x.strip()]:
+            ln_low = normalize_text_for_match(ln)
+            if any(re.search(p, ln_low) for p in patterns):
+                ln_clean = " ".join(ln.split())
+                if 20 <= len(ln_clean) <= 420:
+                    tag = "scheda" if source == "IPZS" else "pag."
+                    evidences.append(f"({tag} {page}) {ln_clean}")
+    out, seen = [], set()
+    for e in evidences:
+        if e not in seen:
+            out.append(e)
+            seen.add(e)
+    return out[:MAX_EVIDENCE_LINES]
+
+
+# ============================================================
+# OPTIONAL BM25 RERANK
+# ============================================================
+def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not BM25_AVAILABLE or not candidates:
+        return candidates
+    corpus = [(c.get("text") or "").lower().split() for c in candidates]
+    bm25 = BM25Okapi(corpus)
+    scores = bm25.get_scores(query.lower().split())
+    idx = np.argsort(-np.array(scores))
+    return [candidates[int(i)] for i in idx]
+
+
+# ============================================================
+# ⭐ HARD GUARDRAIL: MANSIONI SUPERIORI (NO LLM)
+# ============================================================
+def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    txt_all = " ".join([normalize_text_for_match(c.get("text") or "") for c in chunks])
+
+    found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
+    found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
+
+    has_trattamento = re.search(r"ha\s+diritto\s+al\s+trattamento\s+corrispondente|trattamento\s+corrispondente", txt_all) is not None
+    has_esclusione = re.search(r"non\s+si\s+applica.*sostituzion|sostituzion.*conservazion|diritto.*conservazion.*posto", txt_all) is not None
+    has_formazione = (re.search(r"formazion|addestramento|affiancamento", txt_all) is not None) and (re.search(r"non\s+costituisc", txt_all) is not None)
+
+    pages = set()
+    for c in chunks:
+        try:
+            pages.add(int(c.get("page", 0)))
+        except Exception:
+            pass
+
+    return {
+        "found_30": found_30,
+        "found_60": found_60,
+        "has_trattamento": has_trattamento,
+        "has_esclusione": has_esclusione,
+        "has_formazione": has_formazione,
+        "pages": sorted([p for p in pages if p]),
+    }
+
+
+def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
+    ql = user_q.lower()
+
+    # ✅ eccezione SOLO se domanda su stabilizzazione/passaggio livello/30-60
+    ask_stabilizzazione = any(x in ql for x in [
+        "categoria", "livello", "passaggio", "inquadramento", "definitiv",
+        "stabilizz", "30", "60", "giorni", "matur", "diviene definitiva"
+    ])
+
+    diff_paga = rules.get("has_trattamento", False)
+    has_30_60 = bool(rules.get("found_30", False) and rules.get("found_60", False))
+
+    parts: List[str] = []
+
+    # Differenza paga (trattamento)
+    if any(x in ql for x in ["pagato", "pagata", "differenza", "trattamento", "retribuzione", "piu", "più"]):
+        if diff_paga:
+            parts.append(
+                "Nel caso di assegnazione a **mansioni superiori**, il dipendente ha diritto al **trattamento corrispondente all’attività svolta** "
+                "(quindi alla differenza retributiva per il periodo in cui svolge quelle mansioni)."
+            )
+        else:
+            parts.append("Non ho trovato la regola sul trattamento economico per mansioni superiori nei documenti caricati (nel materiale recuperato).")
+
+    # Stabilizzazione (30/60) + eccezione solo qui
+    if ask_stabilizzazione:
+        if has_30_60:
+            parts.append(
+                "L’assegnazione diventa **definitiva** trascorso il periodo di:\n"
+                "- **30 giorni** per periodi **continuativi**;\n"
+                "- **60 giorni** per periodi **non continuativi**."
+            )
+        else:
+            parts.append("Non ho trovato nei documenti caricati la regola specifica sui giorni (30/60) per la definitività (nel materiale recuperato).")
+
+        if rules.get("has_esclusione", False):
+            parts.append(
+                "⚠️ **Eccezione (solo stabilizzazione 30/60):** la previsione sulla **definitività** (passaggio di livello dopo 30/60 giorni) "
+                "**non si applica** se l’assegnazione avvieneloat(sum(top3) / max(1, len(top3)))
 
     med = float(np.median(np.array(sim_values, dtype=np.float32)))
     spread = float(best - med)
@@ -1054,3 +1312,4 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
+
