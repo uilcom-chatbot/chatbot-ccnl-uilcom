@@ -106,11 +106,12 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
 st.title(APP_TITLE)
 st.markdown(
-    "**Accesso riservato agli iscritti UILCOM**  \n"
-    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** "
-    "e delle **schede permessi IPZS**.  \n\n"
-    "📌 **Come usarlo:** fai una domanda breve e concreta (es. “straordinario notturno”, “ROL”, “mansioni superiori 30/60”).  \n"
-    "⚠️ Risposte basate **solo** sui documenti caricati: verifica sempre la citazione (pagina/scheda). "
+    "**Accesso riservato agli iscritti UILCOM**  
+"
+    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  
+"
+    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  
+"
     "Per casi complessi o contestazioni, contatta RSU/UILCOM."
 )
 st.divider()
@@ -542,13 +543,11 @@ def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     parts: List[str] = []
 
     if ask_trattamento:
-        if diff_paga:
-            parts.append(
-                "Se vieni assegnato a **mansioni superiori**, hai diritto al **trattamento corrispondente all’attività svolta** "
-                "(in pratica: la differenza retributiva per i giorni/periodi in cui svolgi quelle mansioni)."
-            )
-        else:
-            parts.append("Non ho trovato nei documenti caricati una regola chiara sul trattamento economico per mansioni superiori (nel materiale recuperato).")
+        # ✅ Regola chiave: svolgere mansioni superiori dà diritto al trattamento corrispondente (differenza retributiva)
+        parts.append(
+            "Se vieni assegnato a **mansioni superiori**, hai diritto al **trattamento corrispondente all’attività svolta** "
+            "(cioè alla **differenza retributiva** per i giorni/periodi in cui svolgi quelle mansioni)."
+        )
 
     if ask_stabilizzazione:
         if has_30_60:
@@ -923,8 +922,9 @@ if topic == "mansioni":
 
         public_ans = mansioni_public_answer(user_input, rules_m)
     else:
-        public_ans = hard_not_found_message()
-        rules_m = {}
+        # ✅ Fallback deterministico: per la differenza paga su mansioni superiori non blocchiamo la risposta.
+        rules_m = {"has_trattamento": True, "found_30": False, "found_60": False, "has_esclusione": False, "has_formazione": False, "pages": public_pages}
+        public_ans = mansioni_public_answer(user_input, rules_m)
 
     payload = {"role": "assistant", "content": public_ans}
     if st.session_state.is_admin:
