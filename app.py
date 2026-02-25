@@ -530,18 +530,21 @@ def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     if ask_stabilizzazione:
         if has_30_60:
             parts.append(
-                "L’assegnazione diventa **definitiva** trascorso il periodo di:\n"
-                "- **30 giorni** per periodi **continuativi**;\n"
-                "- **60 giorni** per periodi **non continuativi**."
-            )
+    "La categoria superiore si **matura** quando il lavoratore viene adibito a mansioni di livello più alto "
+    "per un determinato periodo di tempo.\n\n"
+    "In particolare, l’assegnazione diventa **definitiva** dopo:\n"
+    "- **30 giorni consecutivi** di svolgimento delle mansioni superiori;\n"
+    "- **60 giorni complessivi**, anche non continuativi."
+)
         else:
             parts.append("Non ho trovato nei documenti caricati la regola specifica sui giorni (30/60) per la definitività (nel materiale recuperato).")
 
         if rules.get("has_esclusione", False):
             parts.append(
-                "⚠️ **Eccezione (solo stabilizzazione 30/60):** la previsione sulla **definitività** (passaggio di livello dopo 30/60 giorni) "
-                "**non si applica** se l’assegnazione avviene per **sostituzione** di un dipendente assente con **diritto alla conservazione del posto**."
-            )
+    "⚠️ **Eccezione:** questi termini non si applicano se l’assegnazione avviene per **sostituzione** "
+    "di un dipendente assente con **diritto alla conservazione del posto**. "
+    "In questo caso non matura il passaggio definitivo di categoria."
+)
 
     # Nota formazione (neutra)
     if rules.get("has_formazione", False):
@@ -943,4 +946,5 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
+
 
