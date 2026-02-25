@@ -301,6 +301,12 @@ PERMESSI_TRIGGERS = [
     "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
     "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami",
     "104", "assemblea", "sindac", "donazione", "rol", "ex festiv",
+    "rao",
+    "r.a.o",
+    "riposi annui",
+    "riposo annuo",
+    "riposo annuo ordinario",
+    "riposo annuo (rao)",
 ]
 
 ROL_EXFEST_TRIGGERS = [
@@ -309,6 +315,10 @@ ROL_EXFEST_TRIGGERS = [
     "festività soppresse", "festivita soppresse",
     "festività abolite", "festivita abolite",
     "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
+    "rao",
+    "r.a.o",
+    "riposi annui",
+    "riposo annuo",
 ]
 
 MALATTIA_TRIGGERS = [
@@ -959,7 +969,7 @@ if topic == "straordinari":
 # ============================================================
 # LLM per gli altri topic
 # ============================================================
-if not retrieval_ok:
+if (not retrieval_ok) and (topic not in ("permessi", "rol_exfest")):
     payload = {"role": "assistant", "content": hard_not_found_message()}
     if st.session_state.is_admin:
         payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence, "evidence": key_evidence}
