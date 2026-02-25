@@ -106,9 +106,12 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
 st.title(APP_TITLE)
 st.markdown(
-    "**Accesso riservato agli iscritti UILCOM**  "
-    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  "
-    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  "
+    "**Accesso riservato agli iscritti UILCOM**  
+"
+    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  
+"
+    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  
+"
     "Per casi complessi o contestazioni, contatta RSU/UILCOM."
 )
 st.divider()
@@ -869,6 +872,9 @@ st.session_state.messages.append({"role": "user", "content": user_input})
 # SCEGLI SORGENTE
 # ============================================================
 topic = detect_topic(user_input)
+# ✅ Forza corretta classificazione: se c'è "straordinario" non deve finire su IPZS/permessi
+if "straordin" in (user_input or "").lower():
+    topic = "straordinari"
 enriched_q = build_enriched_question(user_input, topic)
 
 use_ipzs = topic in ("permessi", "rol_exfest")
