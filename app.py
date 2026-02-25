@@ -4,17 +4,19 @@
 # ✅ Admin: debug + evidenze + chunk/pagine usate
 # ✅ Topic reset: se cambia argomento, NON usa memoria breve (evita contaminazioni)
 # ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
-# ✅ Mansioni superiori: risposta deterministica (NO LLM) + pagine
-# ✅ Migliorie 2026-02 (rev3):
-#    - Matching robusto apostrofi tipografici (’)
-#    - Query “chiave” per mansioni superiori
-#    - Fallback retrieval mirato se manca “trattamento corrispondente”
-#    - Eccezione “sostituzione/conservazione del posto” mostrata SOLO se l’utente chiede passaggio livello/definitività (30/60)
+# ✅ Guardrail deterministici:
+#    - Mansioni superiori (30/60 + trattamento corrispondente) con italiano “pulito”
+#    - Straordinari IPZS (percentuali corrette) + filtro/esclusione Parte Sesta
+#
+# ✅ Rev4 (2026-02):
+#    - Guardrail straordinari IPZS (NO 40/80): forza percentuali IPZS + nota Parte Sesta (fino a “periodici).”)
+#    - Esclusione Parte Sesta dal retrieval (filtri su chunk CCNL)
+#    - Italiano migliorato (risposte più chiare, tono “sindacale”, esempi minimi)
+#    - Eccezione “sostituzione/conservazione del posto” mostrata SOLO se l’utente chiede stabilizzazione/passaggio livello (30/60)
 
 import os
 import json
 import re
-import hashlib
 from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
@@ -52,7 +54,6 @@ META_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "chunks.json")
 # Chunking
 CHUNK_SIZE = 1200
 CHUNK_OVERLAP = 150
-
 IPZS_CHUNK_SIZE = 1000
 IPZS_CHUNK_OVERLAP = 120
 
@@ -65,7 +66,7 @@ MAX_MULTI_QUERIES = 8
 MAX_CHUNKS_PER_PAGE = 3
 NEAR_DUP_JACCARD = 0.92
 
-# Memoria: usata SOLO se stesso argomento (topic)
+# Memoria: usata SOLO se stesso argomento
 MEMORY_USER_TURNS = 3
 
 # Hard guardrail retrieval
@@ -108,9 +109,9 @@ st.markdown(
     "**Accesso riservato agli iscritti UILCOM**  \n"
     "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** "
     "e delle **schede permessi IPZS**.  \n\n"
-    "⚠️ Le risposte sono generate **solo** in base ai documenti caricati. "
-    "Le citazioni (pagine/schede) sono incluse per permettere la verifica diretta. "
-    "Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
+    "📌 **Come usarlo:** fai una domanda breve e concreta (es. “straordinario notturno”, “ROL”, “mansioni superiori 30/60”).  \n"
+    "⚠️ Risposte basate **solo** sui documenti caricati: verifica sempre la citazione (pagina/scheda). "
+    "Per casi complessi o contestazioni, contatta RSU/UILCOM."
 )
 st.divider()
 
@@ -158,7 +159,7 @@ if not OPENAI_API_KEY:
 
 
 # ============================================================
-# TEXT NORMALIZATION (apostrophes etc.)
+# TEXT NORMALIZATION
 # ============================================================
 def normalize_text_for_match(s: str) -> str:
     if not s:
@@ -166,6 +167,20 @@ def normalize_text_for_match(s: str) -> str:
     s = s.replace("’", "'").replace("“", '"').replace("”", '"')
     s = re.sub(r"\s+", " ", s)
     return s.lower()
+
+
+# ============================================================
+# CCNL: ESCLUSIONE PARTE SESTA (periodici/quotidiani)
+# ============================================================
+def is_parte_sesta_chunk(text: str) -> bool:
+    t = normalize_text_for_match(text or "")
+    if "parte sesta" in t:
+        return True
+    if ("giornali" in t and ("quotidiani" in t or "periodici" in t)):
+        return True
+    if ("aziende" in t and "editrici" in t and "stampatrici" in t):
+        return True
+    return False
 
 
 # ============================================================
@@ -236,7 +251,7 @@ def _jaccard(a: List[str], b: List[str]) -> float:
     return len(sa & sb) / max(1, len(sa | sb))
 
 
-def _dedup_near_identical(chunks: List[Dict[str, Any]], thr: float = NEAR_DUP_JACCARD) -> List[Dict[str, Any]]:
+def _dedup_near_identical(chunks: List[Dict[str, Any]], thr: float = 0.92) -> List[Dict[str, Any]]:
     kept: List[Dict[str, Any]] = []
     kept_tok: List[List[str]] = []
     for c in chunks:
@@ -248,7 +263,7 @@ def _dedup_near_identical(chunks: List[Dict[str, Any]], thr: float = NEAR_DUP_JA
     return kept
 
 
-def _limit_per_page(chunks: List[Dict[str, Any]], max_per_page: int = MAX_CHUNKS_PER_PAGE) -> List[Dict[str, Any]]:
+def _limit_per_page(chunks: List[Dict[str, Any]], max_per_page: int = 3) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     cnt: Dict[Any, int] = {}
     for c in chunks:
@@ -274,36 +289,37 @@ def compute_retrieval_confidence(sim_values: List[float]) -> Dict[str, float]:
 # TRIGGERS / TOPIC
 # ============================================================
 MANSIONI_TRIGGERS = [
-    "mansioni superiori", "mansione superiore", "mansioni più alte", "mansioni piu alte",
+    "mansioni superiori", "mansione superiore",
     "categoria superiore", "livello superiore", "passaggio di categoria", "cambio categoria",
-    "inquadramento superiore", "posto vacante", "sostituzione", "sto sostituendo",
-    "differenza paga", "differenza di paga", "pagato di più", "pagato di piu",
+    "inquadramento superiore", "differenza paga", "differenza di paga",
     "trattamento corrispondente", "retribuzione corrispondente",
+    "30 giorni", "60 giorni", "diviene definitiva", "definitiva",
+    "sostituzione", "conservazione del posto",
 ]
+
 PERMESSI_TRIGGERS = [
     "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
-    "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami", "formazione",
-    "104", "assemblea", "sindac", "donazione", "rol", "ex festiv", "festività soppresse", "festivita soppresse",
-    "festività abolite", "festivita abolite",
+    "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami",
+    "104", "assemblea", "sindac", "donazione", "rol", "ex festiv",
 ]
+
 ROL_EXFEST_TRIGGERS = [
     "rol", "r.o.l", "riduzione orario",
     "ex festiv", "ex-festiv", "exfestiv",
     "festività soppresse", "festivita soppresse",
     "festività abolite", "festivita abolite",
-    "festività infrasettimanali", "festivita infrasettimanali",
     "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
 ]
+
 MALATTIA_TRIGGERS = [
-    "malattia", "certificato", "certificat", "inps",
+    "malattia", "certificato", "inps",
     "comporto", "prognosi", "ricaduta",
     "visita fiscale", "reperibil", "fasce",
-    "ricovero", "day hospital",
-    "infortunio",
 ]
+
 STRAORDINARI_TRIGGERS = [
     "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
-    "notturno", "festivo", "supplementare"
+    "notturno", "festivo", "feriale",
 ]
 
 
@@ -327,6 +343,11 @@ def is_malattia_question(q: str) -> bool:
     return any(t in ql for t in MALATTIA_TRIGGERS)
 
 
+def is_straordinario_question(q: str) -> bool:
+    ql = q.lower()
+    return any(t in ql for t in STRAORDINARI_TRIGGERS) or ("straordin" in ql)
+
+
 def is_straordinario_notturno_question(q: str) -> bool:
     ql = q.lower()
     return ("straordin" in ql) and ("notturn" in ql)
@@ -347,8 +368,8 @@ def detect_topic(q: str) -> str:
         return "rol_exfest"
     if is_permessi_question(ql):
         return "permessi"
-    if any(t in ql for t in STRAORDINARI_TRIGGERS):
-        return "straordinari_notturno_festivo"
+    if is_straordinario_question(ql):
+        return "straordinari"
     return "altro"
 
 
@@ -380,40 +401,35 @@ def build_enriched_question(current_q: str, current_topic: str) -> str:
 # ============================================================
 def build_queries(q: str) -> List[str]:
     q0 = q.strip()
-    qlow = q0.lower()
     qs = [q0, f"{q0} CCNL regola"]
 
-    user_is_rol = is_rol_exfest_question(q0)
-    user_is_perm = is_permessi_question(q0)
-    user_is_mal = is_malattia_question(q0)
-    user_is_mans = is_mansioni_question(q0)
-
-    if user_is_rol:
+    if is_rol_exfest_question(q0):
         qs += [
             "RAO festività infrasettimanali abolite riposi retribuiti",
             "ROL riduzione orario di lavoro maturazione fruizione monte ore",
         ]
-    if user_is_perm and (not user_is_rol):
+    if is_permessi_question(q0) and (not is_rol_exfest_question(q0)):
         qs += [
             "permessi retribuiti tipologie elenco",
             "permesso studio una settimana l'anno",
             "donazione sangue permesso retribuito",
             "legge 104 art 33 comma 3 permesso",
         ]
-    if user_is_mal:
+    if is_malattia_question(q0):
         qs += [
             "malattia trattamento economico integrazione",
             "malattia periodo di comporto conservazione posto",
             "malattia visite fiscali reperibilità fasce",
         ]
-    if any(t in qlow for t in STRAORDINARI_TRIGGERS):
+    if is_straordinario_question(q0):
         qs += [
-            "lavoro straordinario maggiorazioni limiti",
-            "straordinario notturno maggiorazione",
-            "lavoro notturno maggiorazione",
-            "lavoro festivo maggiorazioni",
+            "lavoro straordinario maggiorazioni",
+            "straordinario diurno maggiorazione 35",
+            "straordinario notturno maggiorazione 60",
+            "straordinario festivo maggiorazione 60",
+            "straordinario grafici editoria maggiorazione 35 60",
         ]
-    if user_is_mans:
+    if is_mansioni_question(q0):
         qs += [
             "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
             "mansioni superiori trattamento corrispondente all'attività svolta",
@@ -431,13 +447,14 @@ def build_queries(q: str) -> List[str]:
 
 
 # ============================================================
-# EVIDENCE EXTRACTION
+# EVIDENCE EXTRACTION (debug)
 # ============================================================
 def extract_key_evidence(chunks: List[Dict[str, Any]], source: str) -> List[str]:
     patterns = [
-        r"\b30\b", r"\b60\b", r"mansioni?\s+superiori?",
-        r"sostituzion", r"conservazion.*posto",
-        r"ha\s+diritto\s+al\s+trattamento", r"trattamento\s+corrispondente",
+        r"\b30\b", r"\b60\b",
+        r"mansioni?\s+superiori?", r"trattamento\s+corrispondente",
+        r"straordin", r"maggiorazion", r"\b35%\b", r"\b60%\b", r"\b40%\b", r"\b80%\b",
+        r"parte\s+sesta", r"quotidiani", r"periodici",
         r"\brao\b", r"\brol\b",
     ]
     evidences: List[str] = []
@@ -473,7 +490,7 @@ def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, 
 
 
 # ============================================================
-# ⭐ HARD GUARDRAIL: MANSIONI SUPERIORI (NO LLM)
+# GUARDRAIL: MANSIONI SUPERIORI (deterministico)
 # ============================================================
 def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     txt_all = " ".join([normalize_text_for_match(c.get("text") or "") for c in chunks])
@@ -481,8 +498,16 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
     found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
 
-    has_trattamento = re.search(r"ha\s+diritto\s+al\s+trattamento\s+corrispondente|trattamento\s+corrispondente", txt_all) is not None
-    has_esclusione = re.search(r"non\s+si\s+applica.*sostituzion|sostituzion.*conservazion|diritto.*conservazion.*posto", txt_all) is not None
+    has_trattamento = re.search(
+        r"ha\s+diritto\s+al\s+trattamento\s+corrispondente|trattamento\s+corrispondente",
+        txt_all
+    ) is not None
+
+    has_esclusione = re.search(
+        r"non\s+si\s+applica.*sostituzion|sostituzion.*conservazion|diritto.*conservazion.*posto",
+        txt_all
+    ) is not None
+
     has_formazione = (re.search(r"formazion|addestramento|affiancamento", txt_all) is not None) and (re.search(r"non\s+costituisc", txt_all) is not None)
 
     pages = set()
@@ -505,86 +530,107 @@ def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
 def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     ql = user_q.lower()
 
-    # ✅ eccezione SOLO se domanda su stabilizzazione/passaggio livello/30-60
     ask_stabilizzazione = any(x in ql for x in [
         "categoria", "livello", "passaggio", "inquadramento", "definitiv",
         "stabilizz", "30", "60", "giorni", "matur", "diviene definitiva"
     ])
+    ask_trattamento = any(x in ql for x in ["differenza", "paga", "pagato", "trattamento", "retribuzione"])
 
     diff_paga = rules.get("has_trattamento", False)
     has_30_60 = bool(rules.get("found_30", False) and rules.get("found_60", False))
 
     parts: List[str] = []
 
-    # Differenza paga (trattamento)
-    if any(x in ql for x in ["pagato", "pagata", "differenza", "trattamento", "retribuzione", "piu", "più"]):
+    if ask_trattamento:
         if diff_paga:
             parts.append(
-                "Nel caso di assegnazione a **mansioni superiori**, il dipendente ha diritto al **trattamento corrispondente all’attività svolta** "
-                "(quindi alla differenza retributiva per il periodo in cui svolge quelle mansioni)."
+                "Se vieni assegnato a **mansioni superiori**, hai diritto al **trattamento corrispondente all’attività svolta** "
+                "(in pratica: la differenza retributiva per i giorni/periodi in cui svolgi quelle mansioni)."
             )
         else:
-            parts.append("Non ho trovato la regola sul trattamento economico per mansioni superiori nei documenti caricati (nel materiale recuperato).")
+            parts.append("Non ho trovato nei documenti caricati una regola chiara sul trattamento economico per mansioni superiori (nel materiale recuperato).")
 
-    # Stabilizzazione (30/60) + eccezione solo qui
     if ask_stabilizzazione:
         if has_30_60:
             parts.append(
-    "La categoria superiore si **matura** quando il lavoratore viene adibito a mansioni di livello più alto "
-    "per un determinato periodo di tempo.\n\n"
-    "In particolare, l’assegnazione diventa **definitiva** dopo:\n"
-    "- **30 giorni consecutivi** di svolgimento delle mansioni superiori;\n"
-    "- **60 giorni complessivi**, anche non continuativi."
-)
+                "La categoria/livello superiore **matura** (diventa definitivo) dopo:\n"
+                "- **30 giorni consecutivi** di mansioni superiori;\n"
+                "- **60 giorni complessivi**, anche non continuativi."
+            )
         else:
-            parts.append("Non ho trovato nei documenti caricati la regola specifica sui giorni (30/60) per la definitività (nel materiale recuperato).")
+            parts.append("Non ho trovato nei documenti caricati la regola 30/60 giorni sulla definitività (nel materiale recuperato).")
 
         if rules.get("has_esclusione", False):
             parts.append(
-    "⚠️ **Eccezione:** questi termini non si applicano se l’assegnazione avviene per **sostituzione** "
-    "di un dipendente assente con **diritto alla conservazione del posto**. "
-    "In questo caso non matura il passaggio definitivo di categoria."
-)
+                "⚠️ **Eccezione:** la maturazione/definitività **non opera** se l’assegnazione avviene per **sostituzione** "
+                "di un dipendente assente con **diritto alla conservazione del posto**."
+            )
 
-    # Nota formazione (neutra)
     if rules.get("has_formazione", False):
         parts.append(
-            "ℹ️ **Nota:** i periodi di **formazione/addestramento in affiancamento** a dipendenti di categorie più elevate **non costituiscono** assegnazione a mansioni superiori."
+            "ℹ️ **Nota:** la **formazione/addestramento in affiancamento** con personale di categoria superiore "
+            "non è considerata assegnazione a mansioni superiori."
         )
 
     if not parts:
         if diff_paga and has_30_60:
-            parts.append("Per mansioni superiori: diritto al **trattamento corrispondente** e definitività dopo **30 giorni continuativi** o **60 non continuativi**.")
+            parts.append("Per mansioni superiori: trattamento corrispondente + possibile maturazione del livello dopo 30 giorni consecutivi o 60 complessivi.")
         elif diff_paga:
-            parts.append("Per mansioni superiori: diritto al **trattamento corrispondente** all’attività svolta.")
+            parts.append("Per mansioni superiori: trattamento corrispondente all’attività svolta.")
         else:
             parts.append("Non ho trovato la risposta nei documenti caricati.")
 
     cit = format_public_citations("CCNL", rules.get("pages", []) or [])
     if cit:
         parts.append(cit)
-
     return "\n\n".join(parts).strip()
 
 
 # ============================================================
-# SYSTEM RULES (LLM)
+# GUARDRAIL: STRAORDINARI IPZS (deterministico)
+# ============================================================
+def straordinari_ipzs_public_answer(user_q: str, cc_pages: List[int]) -> str:
+    ql = user_q.lower()
+
+    lines: List[str] = []
+    lines.append("Per lo **straordinario** (CCNL Grafici-Editoriali), le maggiorazioni sono in genere così articolate:")
+
+    if "ferial" in ql and "festiv" not in ql and "notturn" not in ql:
+        lines.append("- **Straordinario feriale:** **60%**")
+    else:
+        lines.append("- **Straordinario diurno:** **35%**")
+        lines.append("- **Straordinario notturno:** **60%**")
+        lines.append("- **Straordinario festivo:** **60%**")
+
+    lines.append(
+        "ℹ️ Nota: le maggiorazioni del **40%** e **80%** previste dal CCNL riguardano esclusivamente la "
+        "**Parte Sesta** (aziende editrici e stampatrici di giornali quotidiani e periodici)."
+    )
+
+    cit = format_public_citations("CCNL", cc_pages or [])
+    if cit:
+        lines.append(cit)
+    return "\n".join(lines).strip()
+
+
+# ============================================================
+# SYSTEM RULES (LLM) — tono più “sindacale”
 # ============================================================
 RULES_PUBLIC = """
 Sei l’assistente UILCOM per lavoratori IPZS.
-Devi rispondere in modo chiaro e pratico basandoti SOLO sul contesto fornito (estratti dai documenti indicizzati).
-Non inventare informazioni.
+Rispondi in italiano naturale, chiaro e pratico (tono sindacale: “cosa spetta / cosa verificare / cosa fare”),
+basandoti SOLO sul contesto fornito (estratti dai documenti indicizzati). Non inventare informazioni.
 
 REGOLE IMPORTANTI:
 1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nei documenti caricati."
-2) NON confondere lavoro notturno con straordinario notturno.
-3) TERMINOLOGIA EX FESTIVITÀ: se trovi "festività soppresse/abolite/infrasettimanali abolite" spiega che è la dicitura equivalente.
+2) NON confondere lavoro notturno (ordinario) con straordinario notturno.
+3) EX FESTIVITÀ: se trovi "festività soppresse/abolite/infrasettimanali abolite", spiega che è la dicitura equivalente.
 4) Permessi: elenca SOLO le tipologie che trovi nel contesto.
-5) Devi SEMPRE includere una riga finale con la fonte:
+5) Chiudi SEMPRE con una riga fonte:
    - "Fonte: CCNL (pag. ...)" oppure "Fonte: IPZS Permessi (scheda ...)".
 
-FORMATO:
-Risposta diretta e verificabile.
+ATTENZIONE STRAORDINARI:
+- Se nel contesto compaiono 40%/80% o riferimenti a "Parte Sesta / quotidiani / periodici", segnalalo come parte dedicata a quel settore, senza applicarla automaticamente.
 """
 
 
@@ -785,7 +831,7 @@ else:
 
 
 # ============================================================
-# RETRIEVAL
+# RETRIEVAL (con filtro Parte Sesta su CCNL)
 # ============================================================
 if source == "CCNL":
     vectors, meta = load_index(VEC_PATH, META_PATH)
@@ -803,15 +849,18 @@ for q in queries:
     sims = cosine_scores(qvec, mat_norm)
     top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
     for i in top_idx:
-        s = float(sims[int(i)])
-        if (int(i) not in scores_best) or (s > scores_best[int(i)]):
-            scores_best[int(i)] = s
+        idx = int(i)
+        if source == "CCNL" and is_parte_sesta_chunk(meta[idx].get("text", "")):
+            continue
+        s = float(sims[idx])
+        if (idx not in scores_best) or (s > scores_best[idx]):
+            scores_best[idx] = s
 
 ranked_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)
 
 candidates: List[Dict[str, Any]] = []
 cand_scores: List[float] = []
-for i in ranked_idx[: max(TOP_K_FINAL * 3, TOP_K_FINAL) ]:
+for i in ranked_idx[: max(TOP_K_FINAL * 3, TOP_K_FINAL)]:
     candidates.append(meta[int(i)])
     cand_scores.append(float(scores_best[int(i)]))
 
@@ -829,12 +878,9 @@ for c, s in zip(candidates, cand_scores):
 
 selected = _dedup_near_identical(tmp[:TOP_K_FINAL])
 selected_scores = tmp_scores[: len(selected)]
-
 selected = bm25_rerank(enriched_q, selected)
 
-key_evidence = extract_key_evidence(selected, source)
 confidence = compute_retrieval_confidence(selected_scores)
-
 retrieval_ok = (
     confidence["best"] >= MIN_BEST_SIMILARITY
     and confidence["avg_top3"] >= MIN_AVG_TOP3
@@ -842,6 +888,7 @@ retrieval_ok = (
     and len(selected) >= MIN_SELECTED_CHUNKS
 )
 
+key_evidence = extract_key_evidence(selected, source)
 public_pages = unique_pages(selected, max_pages=8)
 public_cit_line = format_public_citations(source, public_pages)
 
@@ -850,7 +897,7 @@ def hard_not_found_message() -> str:
 
 
 # ============================================================
-# MANSIONI: deterministico + fallback
+# ROUTING: GUARDRAIL TOPIC
 # ============================================================
 if topic == "mansioni":
     if source != "CCNL":
@@ -858,17 +905,22 @@ if topic == "mansioni":
         st.rerun()
 
     if retrieval_ok:
-        rules_probe = extract_mansioni_rules(selected)
-        if not rules_probe.get("has_trattamento", False):
+        rules_m = extract_mansioni_rules(selected)
+        if not rules_m.get("has_trattamento", False):
             extra_q = "ha diritto al trattamento corrispondente all’attività svolta mansioni superiori 30 giorni 60 giorni non si applica sostituzione conservazione del posto"
             qvec2 = np.array(emb.embed_query(extra_q), dtype=np.float32)
             sims2 = cosine_scores(qvec2, mat_norm)
             top2 = np.argsort(-sims2)[:10]
-            extra = [meta[int(i)] for i in top2]
+            extra = []
+            for ii in top2:
+                idx2 = int(ii)
+                if is_parte_sesta_chunk(meta[idx2].get("text", "")):
+                    continue
+                extra.append(meta[idx2])
             extra = _limit_per_page(_dedup_near_identical(extra), max_per_page=2)
-            selected = _dedup_near_identical(selected + extra)
+            selected2 = _dedup_near_identical(selected + extra)
+            rules_m = extract_mansioni_rules(selected2)
 
-        rules_m = extract_mansioni_rules(selected)
         public_ans = mansioni_public_answer(user_input, rules_m)
     else:
         public_ans = hard_not_found_message()
@@ -882,6 +934,28 @@ if topic == "mansioni":
             "confidence": confidence,
             "evidence": key_evidence,
             "pages": rules_m.get("pages") if isinstance(rules_m, dict) else None,
+        }
+
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+
+if topic == "straordinari":
+    if source != "CCNL":
+        st.session_state.messages.append({"role": "assistant", "content": "Per lo **straordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
+        st.rerun()
+
+    public_ans = straordinari_ipzs_public_answer(user_input, public_pages)
+
+    payload = {"role": "assistant", "content": public_ans}
+    if st.session_state.is_admin:
+        payload["debug"] = {
+            "topic": topic,
+            "queries": queries,
+            "confidence": confidence,
+            "evidence": key_evidence,
+            "filtered_parte_sesta": True,
         }
 
     st.session_state.last_topic = topic
@@ -946,5 +1020,3 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
-
-
