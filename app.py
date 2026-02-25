@@ -1048,6 +1048,32 @@ if topic == "permessi":
 
 
 # ============================================================
+# GUARDRAIL: STRAORDINARIO CCNL GRAFICI (IPZS)
+# ============================================================
+if topic == "straordinari":
+
+    public_ans = (
+        "Nel settore grafico (IPZS) il lavoro straordinario è compensato con le seguenti maggiorazioni:\n\n"
+        "- **Straordinario diurno:** 35%\n"
+        "- **Straordinario notturno:** 60%\n"
+        "- **Straordinario festivo:** 60%\n\n"
+        "Le percentuali del 40% e 80% previste dal CCNL riguardano esclusivamente la Parte Sesta "
+        "(aziende editrici e stampatrici di giornali quotidiani e periodici)."
+    )
+
+    payload = {"role": "assistant", "content": public_ans}
+
+    if st.session_state.is_admin:
+        payload["debug"] = {
+            "topic": topic,
+            "deterministic_straordinari": True
+        }
+
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+# ============================================================
 # LLM per gli altri topic
 # ============================================================
 if not retrieval_ok:
@@ -1104,4 +1130,3 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
-
