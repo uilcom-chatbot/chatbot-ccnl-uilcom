@@ -633,6 +633,52 @@ def straordinari_ipzs_public_answer(user_q: str, cc_pages: List[int]) -> str:
     return "\n".join(lines).strip()
 
 
+
+
+# ============================================================
+# NOTTURNO ORDINARIO: ESTRAZIONE PERCENTUALI (anche "per cento"/"percento")
+# ============================================================
+def extract_notturno_ordinario_percentuali(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Estrae percentuali e righe rilevanti sul lavoro notturno ordinario dai chunk CCNL.
+    Supporta anche formati tipo "20 per cento" / "20 percento" oltre a "20%".
+    Evita di confondere con percentuali tipiche dello straordinario/Parte Sesta.
+    """
+    lines_hit: List[str] = []
+    perc: List[str] = []
+
+    for c in chunks:
+        page = c.get("page", "?")
+        txt = c.get("text", "") or ""
+        for ln in [x.strip() for x in txt.splitlines() if x.strip()]:
+            lnl = ln.lower()
+
+            # deve parlare di notturno, ma NON di straordinario
+            if ("notturn" in lnl) and ("straordin" not in lnl):
+                lines_hit.append(f"(pag. {page}) " + " ".join(ln.split()))
+
+                # cattura percentuali: "20%", "20 per cento", "20 percento"
+                matches: List[str] = []
+                matches += re.findall(r"\b(\d{1,2})\s*%\b", ln)
+                matches += re.findall(r"\b(\d{1,2})\s*(?:per\s*cento|percento)\b", ln, flags=re.IGNORECASE)
+
+                for m in matches:
+                    # escludi percentuali tipiche dello straordinario/parte sesta per evitare confusioni
+                    if m in ("35", "60", "40", "80"):
+                        continue
+                    perc.append(m + "%")
+
+    # dedup preservando ordine
+    perc_out: List[str] = []
+    seen = set()
+    for p in perc:
+        if p not in seen:
+            perc_out.append(p)
+            seen.add(p)
+
+    return {"percentuali": perc_out, "righe": lines_hit[:10]}
+
+
 # ============================================================
 # SYSTEM RULES (LLM) — tono più “sindacale”
 # ============================================================
@@ -1041,14 +1087,59 @@ if topic == "notturno_ordinario":
         st.session_state.messages.append({"role": "assistant", "content": "Per il **lavoro notturno ordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
         st.rerun()
 
-    if not retrieval_ok:
-        payload = {"role": "assistant", "content": "Non ho trovato nel CCNL caricato la percentuale del **lavoro notturno ordinario** (nel materiale recuperato).\n\n" + format_public_citations("CCNL", public_pages)}
+    # ✅ Retrieval mirato aggiuntivo: spesso la percentuale è scritta come "per cento"/"percento" o in un punto poco richiamato.
+    extra_queries = [
+        "lavoro notturno ordinario maggiorazione per cento",
+        "maggiorazione lavoro notturno per cento",
+        "indennità lavoro notturno ordinario per cento",
+        "lavoro notturno a turni maggiorazione per cento",
+    ]
+
+    extra_chunks: List[Dict[str, Any]] = []
+    for extra_q in extra_queries:
+        qvec2 = np.array(emb.embed_query(extra_q), dtype=np.float32)
+        sims2 = cosine_scores(qvec2, mat_norm)
+        top2 = np.argsort(-sims2)[:25]
+        for ii in top2:
+            idx2 = int(ii)
+            if is_parte_sesta_chunk(meta[idx2].get("text", "")):
+                continue
+            extra_chunks.append(meta[idx2])
+
+    pool = _dedup_near_identical(selected + extra_chunks)
+    pool = bm25_rerank(enriched_q, pool)
+    pages_pool = unique_pages(pool, max_pages=8)
+
+    info = extract_notturno_ordinario_percentuali(pool)
+
+    # ✅ Se troviamo percentuali nel materiale, rispondiamo in modo deterministico (più affidabile dell'LLM)
+    if info.get("percentuali"):
+        perc_txt = ", ".join(info["percentuali"])
+        public_ans = (
+            "Per il **lavoro notturno ordinario** (non straordinario) il CCNL prevede una **maggiorazione**.\n\n"
+            f"**Percentuali trovate nel CCNL:** {perc_txt}\n\n"
+        )
+        if info.get("righe"):
+            public_ans += "Estratti rilevanti:\n" + "\n".join([f"- {r}" for r in info["righe"][:3]]) + "\n\n"
+        public_ans += format_public_citations("CCNL", pages_pool)
+
+        payload = {"role": "assistant", "content": public_ans}
+        if st.session_state.is_admin:
+            payload["debug"] = {
+                "topic": topic,
+                "deterministic_notturno_ordinario": True,
+                "percentuali": info["percentuali"],
+                "righe": info["righe"],
+                "pages": pages_pool,
+                "queries": queries + extra_queries,
+            }
+
         st.session_state.last_topic = topic
         st.session_state.messages.append(payload)
         st.rerun()
 
-    # LLM con guardrail forte: percentuali SOLO se presenti nel contesto
-    context_local = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in selected])
+    # 🔁 Altrimenti: fallback LLM con guardrail forte, usando il pool (più contesto) anche se retrieval_ok era debole
+    context_local = "\n\n---\n\n".join([f"[Pagina {c.get('page','?')}] {c.get('text','')}" for c in pool[:TOP_K_FINAL]])
 
     llm_local = ChatOpenAI(model=LLM_MODEL, temperature=0, api_key=OPENAI_API_KEY)
 
@@ -1056,7 +1147,8 @@ if topic == "notturno_ordinario":
 Rispondi in italiano chiaro e sindacale.
 Devi parlare SOLO di **lavoro notturno ordinario** (NON straordinario).
 Usa SOLO il contesto fornito.
-Se nel contesto NON c’è una percentuale esplicita, scrivi: "Non ho trovato nel CCNL caricato la percentuale del lavoro notturno ordinario."
+Se nel contesto NON c’è una percentuale esplicita (anche scritta come 'per cento' o 'percento'), scrivi:
+"Non ho trovato nel CCNL caricato la percentuale del lavoro notturno ordinario."
 
 DIVIETI:
 - Non usare 35/60/60 (sono dello straordinario).
@@ -1068,7 +1160,7 @@ DOMANDA: {user_input}
 CONTESTO CCNL:
 {context_local}
 
-Chiudi con: {format_public_citations("CCNL", public_pages)}
+Chiudi con: {format_public_citations("CCNL", pages_pool)}
 """
     try:
         ans = llm_local.invoke(prompt_notturno).content
@@ -1076,11 +1168,11 @@ Chiudi con: {format_public_citations("CCNL", public_pages)}
         ans = f"Errore nel generare la risposta: {e}"
 
     if not re.search(r"\bfonte\b\s*:", ans or "", flags=re.IGNORECASE):
-        ans = (ans or "").strip() + "\n\n" + format_public_citations("CCNL", public_pages)
+        ans = (ans or "").strip() + "\n\n" + format_public_citations("CCNL", pages_pool)
 
     payload = {"role": "assistant", "content": (ans or "").strip()}
     if st.session_state.is_admin:
-        payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence, "evidence": key_evidence}
+        payload["debug"] = {"topic": topic, "queries": queries + extra_queries, "confidence": confidence, "evidence": key_evidence, "pages": pages_pool}
 
     st.session_state.last_topic = topic
     st.session_state.messages.append(payload)
