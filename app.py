@@ -628,6 +628,7 @@ def straordinari_ipzs_public_answer(user_q: str, cc_pages: List[int]) -> str:
 # ============================================================
 # GUARDRAIL: ROL / RAO / EX FESTIVITÀ (deterministico – evita confusioni con Legge 104)
 # ============================================================
+
 def rol_exfest_ipzs_public_answer(user_q: str, ipzs_pages: List[int]) -> str:
     ql = (user_q or "").lower()
 
@@ -637,24 +638,26 @@ def rol_exfest_ipzs_public_answer(user_q: str, ipzs_pages: List[int]) -> str:
     if "rao" in ql or "r.a.o" in ql or "riposo annuo" in ql or "riposi annui" in ql:
         lines.append(
             "I **RAO** (riposi annui) sono ore/giornate di permesso retribuito previste dalle regole aziendali IPZS. "
-            "Per sapere **quante ore maturi** e **come si richiedono**, fai riferimento alla scheda IPZS dedicata (procedura presenze/portale)."
+            "Per sapere **quante ore maturi** e **come si richiedono**, fai riferimento alla scheda IPZS dedicata "
+            "(procedura presenze/portale)."
         )
 
     # EX FESTIVITÀ
     if ("ex festiv" in ql) or ("ex-festiv" in ql) or ("exfestiv" in ql) or ("festività soppresse" in ql) or ("festivita soppresse" in ql) or ("festività abolite" in ql) or ("festivita abolite" in ql) or ("infrasettimanali abolite" in ql):
         lines.append(
             "Le **ex festività** (spesso indicate anche come *festività soppresse/abolite* o *infrasettimanali abolite*) "
-            "sono permessi/recuperi riconosciuti secondo le regole IPZS. La fruizione avviene con le modalità indicate nella scheda IPZS."
+            "sono permessi/recuperi riconosciuti secondo le regole IPZS. La fruizione avviene con le modalità indicate "
+            "nella scheda IPZS."
         )
 
     # ROL (default se non RAO/EXFEST o se è presente 'rol')
     if ("rol" in ql) or ("r.o.l" in ql) or (not lines):
         lines.append(
-            "I **ROL** (Riduzione Orario di Lavoro) sono permessi retribuiti che maturano nel tempo e permettono di assentarsi dal lavoro "
-            "mantenendo la retribuzione. **Non vanno confusi** con i permessi della **Legge 104** (che sono un istituto diverso).
-
-"
-            "Per **maturazione**, **residuo** e **modalità di richiesta** fai riferimento alla scheda IPZS ROL/RAO e alla procedura presenze."
+            "I **ROL** (Riduzione Orario di Lavoro) sono permessi retribuiti che maturano nel tempo e permettono di "
+            "assentarsi dal lavoro mantenendo la retribuzione. **Non vanno confusi** con i permessi della **Legge 104** "
+            "(che sono un istituto diverso).\n\n"
+            "Per **maturazione**, **residuo** e **modalità di richiesta** fai riferimento alla scheda IPZS ROL/RAO e "
+            "alla procedura presenze."
         )
 
     cit = format_public_citations("IPZS", ipzs_pages or [])
@@ -663,9 +666,7 @@ def rol_exfest_ipzs_public_answer(user_q: str, ipzs_pages: List[int]) -> str:
     else:
         lines.append("**Fonte:** IPZS Permessi")
 
-    return "
-
-".join(lines).strip()
+    return "\n\n".join(lines).strip()
 
 
 # ============================================================
