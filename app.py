@@ -904,27 +904,19 @@ if topic == "mansioni":
         st.session_state.messages.append({"role": "assistant", "content": "Questa domanda riguarda **mansioni superiori**: la tratto sul **CCNL**. Indicizza il CCNL e riprova."})
         st.rerun()
 
-    if retrieval_ok:
-        rules_m = extract_mansioni_rules(selected)
-        if not rules_m.get("has_trattamento", False):
-            extra_q = "ha diritto al trattamento corrispondente all’attività svolta mansioni superiori 30 giorni 60 giorni non si applica sostituzione conservazione del posto"
-            qvec2 = np.array(emb.embed_query(extra_q), dtype=np.float32)
-            sims2 = cosine_scores(qvec2, mat_norm)
-            top2 = np.argsort(-sims2)[:10]
-            extra = []
-            for ii in top2:
-                idx2 = int(ii)
-                if is_parte_sesta_chunk(meta[idx2].get("text", "")):
-                    continue
-                extra.append(meta[idx2])
-            extra = _limit_per_page(_dedup_near_identical(extra), max_per_page=2)
-            selected2 = _dedup_near_identical(selected + extra)
-            rules_m = extract_mansioni_rules(selected2)
+    # ✅ Guardrail deterministico SEMPRE attivo: non dipende dal retrieval_ok
+    # Recuperiamo comunque i chunk selezionati per provare a prendere pagine/citazioni,
+    # ma se manca qualcosa, rispondiamo comunque con la regola 30/60 e il trattamento.
+    rules_m = extract_mansioni_rules(selected)
 
-        public_ans = mansioni_public_answer(user_input, rules_m)
-    else:
-        public_ans = hard_not_found_message()
-        rules_m = {}
+    # Fallback robusto: se retrieval è debole o non trova i marker, forziamo i punti fermi (30/60 + trattamento)
+    if (not retrieval_ok) or (not rules_m.get("found_30", False)) or (not rules_m.get("found_60", False)):
+        rules_m["found_30"] = True
+        rules_m["found_60"] = True
+    if (not retrieval_ok) or (not rules_m.get("has_trattamento", False)):
+        rules_m["has_trattamento"] = True
+
+    public_ans = mansioni_public_answer(user_input, rules_m)
 
     payload = {"role": "assistant", "content": public_ans}
     if st.session_state.is_admin:
@@ -934,6 +926,7 @@ if topic == "mansioni":
             "confidence": confidence,
             "evidence": key_evidence,
             "pages": rules_m.get("pages") if isinstance(rules_m, dict) else None,
+            "deterministic_mansioni": True,
         }
 
     st.session_state.last_topic = topic
