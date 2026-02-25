@@ -107,7 +107,7 @@ st.title(APP_TITLE)
 st.markdown(
     "**Accesso riservato agli iscritti UILCOM**  \n"
     "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria** "
-    "e delle **schede permessi IPZS** (da screenshot).  \n\n"
+    "e delle **schede permessi IPZS**.  \n\n"
     "⚠️ Le risposte sono generate **solo** in base ai documenti caricati. "
     "Le citazioni (pagine/schede) sono incluse per permettere la verifica diretta. "
     "Per casi specifici o interpretazioni, rivolgersi a RSU/UILCOM o HR."
@@ -943,3 +943,4 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
+
