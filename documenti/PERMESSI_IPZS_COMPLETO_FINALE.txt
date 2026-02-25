@@ -1,4 +1,4 @@
-IPZS - PERMESSI / GIUSTIFICATIVI (TESTI TRASCRITTI DAGLI SCREENSHOT)
+IPZS - PERMESSI / GIUSTIFICATIVI 
 ======================================================================
 
 TESTIMONIANZA CIVILE
@@ -44,16 +44,16 @@ Descrizione:
 Permesso giornaliero retribuito per sostenere prove di esame come previsto dall'art, 10 della Legge n.300 del 1970. Allegare certificato attestante la prova di esame sostenuta.
 
 
-L. 104/92 art. 33/6 
+L. 104/92 art. 33/3 
 -------------------
 Descrizione:
-Permesso orario o giornaliero retribuito per i lavoratori disabili in situazione di gravità ai sensi della legge 104/1992 art 3, comma 3. E' obbligatorio inserire il codice fiscale del lavoratore. L'abilitazione dello stesso è subordinata all'invio della relativa documentazione alla mail giustificativipresenze@ipzs.it.
+Permesso orario o giornaliero retribuito per i lavoratori con familiari disabili in situazione di gravità ai sensi della legge 104/1992 art 3, comma 3. La richiesta deve essere presentata al datore di lavoro 3 giorni lavorativi prima della fruizione salvo casi di eccezionalità. E' obbligatorio inserire il codice fiscale del familiare. L'abilitazione dello stesso è subordinata all'invio della relativa documentazione alla mail giustificativipresenze@ipzs.it.
 
 
 L.104/1992 art. 33/6 G/H
 ------------------------
 Descrizione:
-Permesso giornaliero retribuito per i lavoratori disabili in situazione di gravità ai sensi della legge 104/1992 art 3, comma 3. La richiesta deve essere presentata al datore di lavoro 3 giorni lavorativi prima della fruizione salvo casi di eccezionalità. E' obbligatorio inserire il codice fiscale del lavoratore. La fruizione dello stesso è subordinata all'inoltro della documentazione richiesta alla mail giustificativipresenze@ipzs.it.
+Permesso orario o giornaliero retribuito per i lavoratori disabili in situazione di gravità ai sensi della legge 104/1992 art 3, comma 3. E' obbligatorio inserire il codice fiscale del lavoratore. La fruizione dello stesso è subordinata all'inoltro della documentazione richiesta alla mail giustificativipresenze@ipzs.it.
 
 
 MALATT.BAMB. GRAVE (NIDO)
