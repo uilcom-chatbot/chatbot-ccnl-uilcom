@@ -106,9 +106,12 @@ OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
 st.set_page_config(page_title="Assistente UILCOM IPZS", page_icon="🟦", layout="centered")
 st.title(APP_TITLE)
 st.markdown(
-    "**Accesso riservato agli iscritti UILCOM**  "
-    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  "
-    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  "
+    "**Accesso riservato agli iscritti UILCOM**  
+"
+    "Strumento informativo per facilitare la consultazione del **CCNL Grafici Editoria**.  
+"
+    "Le risposte sono basate solo sui documenti caricati e includono, quando disponibili, riferimenti a pagina/scheda.  
+"
     "Per casi complessi o contestazioni, contatta RSU/UILCOM."
 )
 st.divider()
@@ -299,6 +302,11 @@ PERMESSI_TRIGGERS = [
     "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
     "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami",
     "104", "assemblea", "sindac", "donazione", "rol", "ex festiv",
+    "rao",
+    "r.a.o",
+    "riposi annui",
+    "riposo annuo",
+    "riposo annuo (rao)",
 ]
 
 ROL_EXFEST_TRIGGERS = [
@@ -307,6 +315,10 @@ ROL_EXFEST_TRIGGERS = [
     "festività soppresse", "festivita soppresse",
     "festività abolite", "festivita abolite",
     "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
+    "rao",
+    "r.a.o",
+    "riposi annui",
+    "riposo annuo",
 ]
 
 MALATTIA_TRIGGERS = [
@@ -628,6 +640,55 @@ REGOLE IMPORTANTI:
 ATTENZIONE STRAORDINARI:
 - Se nel contesto compaiono 40%/80% o riferimenti a "Parte Sesta / quotidiani / periodici", segnalalo come parte dedicata a quel settore, senza applicarla automaticamente.
 """
+
+
+
+
+# ============================================================
+# IPZS: ESTRAZIONE TITOLI PERMESSI (per elenco completo)
+# ============================================================
+def extract_ipzs_permessi_titles_from_file(path: str) -> List[str]:
+    """
+    Estrae i titoli delle voci permessi dal file IPZS (titoli in maiuscolo seguiti da linea ----).
+    Serve per dare all'utente l'elenco completo quando chiede "tutti i permessi" / "lista permessi".
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            txt = f.read().replace("\r\n", "\n")
+    except Exception:
+        return []
+
+    lines = [ln.rstrip() for ln in txt.split("\n")]
+    titles: List[str] = []
+    for i in range(len(lines) - 1):
+        title = (lines[i] or "").strip()
+        underline = (lines[i + 1] or "").strip()
+        if not title:
+            continue
+        if re.fullmatch(r"-{3,}", underline):
+            if "IPZS" in title and "PERMESSI" in title:
+                continue
+            if title.upper() != title:
+                continue
+            titles.append(title)
+
+    out: List[str] = []
+    seen = set()
+    for t in titles:
+        if t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
+
+
+def is_lista_permessi_question(q: str) -> bool:
+    ql = (q or "").lower()
+    triggers = [
+        "tutti i permessi", "elenco permessi", "lista permessi", "quali permessi",
+        "quali sono i permessi", "permessi disponibili", "tutte le tipologie di permessi",
+        "tutte le assenze", "giustificativi disponibili",
+    ]
+    return any(t in ql for t in triggers)
 
 
 # ============================================================
@@ -960,6 +1021,35 @@ if topic == "straordinari":
     st.rerun()
 
 
+
+
+if topic == "permessi":
+    # ✅ Permessi/giustificativi: se l'utente chiede l'elenco completo, lo restituiamo in modo deterministico.
+    if source != "IPZS":
+        st.session_state.messages.append({"role": "assistant", "content": "Per i **permessi/giustificativi IPZS** consulto le **schede IPZS**. Indicizza IPZS (permessi) e riprova."})
+        st.rerun()
+
+    if is_lista_permessi_question(user_input):
+        titles = extract_ipzs_permessi_titles_from_file(IPZS_TXT_PATH)
+        if titles:
+            elenco = "\n".join([f"- {t}" for t in titles])
+            public_ans = (
+                "Ecco l’**elenco completo dei permessi/giustificativi** presenti nelle schede IPZS:\n\n"
+                f"{elenco}\n\n"
+                "**Fonte:** IPZS Permessi"
+            )
+        else:
+            public_ans = "Non riesco a leggere l’elenco dal file IPZS (controlla che il TXT sia presente in /documenti)."
+
+        payload = {"role": "assistant", "content": public_ans}
+        if st.session_state.is_admin:
+            payload["debug"] = {"topic": topic, "deterministic_lista_permessi": True, "count": len(titles) if titles else 0}
+
+        st.session_state.last_topic = topic
+        st.session_state.messages.append(payload)
+        st.rerun()
+
+
 # ============================================================
 # LLM per gli altri topic
 # ============================================================
@@ -1017,4 +1107,3 @@ if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
 st.session_state.last_topic = topic
 st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
 st.rerun()
-
