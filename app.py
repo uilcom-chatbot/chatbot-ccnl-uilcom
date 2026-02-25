@@ -1014,6 +1014,33 @@ def hard_not_found_message() -> str:
     return "Non ho trovato la risposta nei documenti caricati."
 
 
+
+
+# ============================================================
+# CCNL: FULL SCAN per NOTTURNO ORDINARIO (fallback se retrieval non pesca il chunk giusto)
+# ============================================================
+def fullscan_notturno_ordinario(meta_all: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Cerca in TUTTI i chunk del CCNL righe con:
+    - 'notturn' e '%'
+    - e NON 'straordin'
+    Esclude la Parte Sesta per evitare contaminazioni.
+    Ritorna una lista di chunk candidati (con pagina e testo).
+    """
+    out: List[Dict[str, Any]] = []
+    for c in meta_all:
+        txt = c.get("text", "") or ""
+        t = normalize_text_for_match(txt)
+
+        if "notturn" in t and "%" in t and "straordin" not in t:
+            if is_parte_sesta_chunk(txt):
+                continue
+            out.append(c)
+
+    out = _dedup_near_identical(out)
+    return out[:40]
+
+
 # ============================================================
 # ROUTING: GUARDRAIL TOPIC
 # ============================================================
@@ -1111,6 +1138,16 @@ if topic == "notturno_ordinario":
     pages_pool = unique_pages(pool, max_pages=8)
 
     info = extract_notturno_ordinario_percentuali(pool)
+
+    # 🔁 Fallback: se non troviamo percentuali nel pool, facciamo una scansione diretta su TUTTI i chunk CCNL
+    if not info.get("percentuali"):
+        scan_chunks = fullscan_notturno_ordinario(meta)
+        pool2 = _dedup_near_identical(pool + scan_chunks)
+        pool2 = bm25_rerank(enriched_q, pool2)
+        pages_pool = unique_pages(pool2, max_pages=8)
+        info = extract_notturno_ordinario_percentuali(pool2)
+        pool = pool2
+
 
     # ✅ Se troviamo percentuali nel materiale, rispondiamo in modo deterministico (più affidabile dell'LLM)
     if info.get("percentuali"):
