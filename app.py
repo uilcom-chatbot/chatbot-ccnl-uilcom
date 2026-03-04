@@ -1,18 +1,12 @@
-# app.py — Assistente Contrattuale UILCOM IPZS (CCNL + Indice IPZS Permessi)
-# ✅ Risposte SOLO dai documenti caricati (CCNL PDF + IPZS Permessi TXT)
-# ✅ Pubblico: include SEMPRE citazioni (pagine/schede)
-# ✅ Admin: debug + evidenze + chunk/pagine usate
-# ✅ Topic reset: se cambia argomento, NON usa memoria breve (evita contaminazioni)
-# ✅ Guardrail HARD: se retrieval debole -> "Non ho trovato..."
-# ✅ Guardrail deterministici:
-#    - Mansioni superiori (30/60 + trattamento corrispondente) con italiano “pulito”
-#    - Straordinari IPZS (percentuali corrette) + filtro/esclusione Parte Sesta
-#
-# ✅ Rev4 (2026-02):
-#    - Guardrail straordinari IPZS (NO 40/80): forza percentuali IPZS + nota Parte Sesta (fino a “periodici).”)
-#    - Esclusione Parte Sesta dal retrieval (filtri su chunk CCNL)
-#    - Italiano migliorato (risposte più chiare, tono “sindacale”, esempi minimi)
-#    - Eccezione “sostituzione/conservazione del posto” mostrata SOLO se l’utente chiede stabilizzazione/passaggio livello (30/60)
+# app.py — Assistente Contrattuale UILCOM IPZS
+# ✅ Rev16 — 7 miglioramenti implementati:
+#   1. Routing topic via LLM (classificatore, no keyword fragili)
+#   2. Cross-encoder reranker (sentence-transformers, fallback BM25)
+#   3. Guardrail estesi: ferie, TFR, maternità, preavviso, congedo matrimoniale
+#   4. GPT-4o automatico per domande complesse
+#   5. Soglie retrieval calibrate per topic
+#   6. Memoria conversazionale migliorata (ultimi 2 turni completi domanda+risposta)
+#   7. Risposta LLM strutturata in JSON (confidenza, fonte, avvertenza)
 
 import os
 import json
@@ -26,12 +20,20 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
-# Optional (precision boost): rank-bm25
+# Optional: rank-bm25
 try:
     from rank_bm25 import BM25Okapi  # type: ignore
     BM25_AVAILABLE = True
 except Exception:
     BM25_AVAILABLE = False
+
+# Miglioramento 2: cross-encoder reranker
+try:
+    from sentence_transformers import CrossEncoder  # type: ignore
+    _CE_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    CE_AVAILABLE = True
+except Exception:
+    CE_AVAILABLE = False
 
 
 # ============================================================
@@ -39,48 +41,55 @@ except Exception:
 # ============================================================
 APP_TITLE = "🟦 Assistente Contrattuale UILCOM IPZS"
 
-# CCNL
-PDF_PATH = os.path.join("documenti", "ccnl.pdf")
-INDEX_DIR = "index_ccnl"
-VEC_PATH = os.path.join(INDEX_DIR, "vectors.npy")
-META_PATH = os.path.join(INDEX_DIR, "chunks.json")
+PDF_PATH      = os.path.join("documenti", "ccnl.pdf")
+INDEX_DIR     = "index_ccnl"
+VEC_PATH      = os.path.join(INDEX_DIR, "vectors.npy")
+META_PATH     = os.path.join(INDEX_DIR, "chunks.json")
 
-# IPZS Permessi (TXT da screenshot)
-IPZS_TXT_PATH = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
-INDEX_DIR_IPZS = "index_ipzs_permessi"
-VEC_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "vectors.npy")
-META_PATH_IPZS = os.path.join(INDEX_DIR_IPZS, "chunks.json")
+IPZS_TXT_PATH    = os.path.join("documenti", "PERMESSI_IPZS_COMPLETO_FINALE.txt")
+INDEX_DIR_IPZS   = "index_ipzs_permessi"
+VEC_PATH_IPZS    = os.path.join(INDEX_DIR_IPZS, "vectors.npy")
+META_PATH_IPZS   = os.path.join(INDEX_DIR_IPZS, "chunks.json")
 
-# Chunking
-CHUNK_SIZE = 1200
-CHUNK_OVERLAP = 150
-IPZS_CHUNK_SIZE = 1000
+CHUNK_SIZE         = 1200
+CHUNK_OVERLAP      = 150
+IPZS_CHUNK_SIZE    = 1000
 IPZS_CHUNK_OVERLAP = 120
 
-# Retrieval
-TOP_K_PER_QUERY = 10
-TOP_K_FINAL = 18
+TOP_K_PER_QUERY   = 10
+TOP_K_FINAL       = 18
 MAX_MULTI_QUERIES = 8
-
-# Dedup / diversity
 MAX_CHUNKS_PER_PAGE = 3
-NEAR_DUP_JACCARD = 0.92
+NEAR_DUP_JACCARD    = 0.92
 
-# Memoria: usata SOLO se stesso argomento
-MEMORY_USER_TURNS = 3
+# Miglioramento 6: memoria completa (domanda + risposta)
+MEMORY_FULL_TURNS = 2
 
-# Hard guardrail retrieval
-MIN_BEST_SIMILARITY = 0.245
-MIN_AVG_TOP3 = 0.220
-MIN_SPREAD = 0.020
-MIN_SELECTED_CHUNKS = 3
-
-# Admin debug
 MAX_EVIDENCE_LINES = 18
 
-# LLM
-LLM_MODEL = "gpt-4o-mini"
-LLM_TEMPERATURE = 0
+# Miglioramento 4: modelli
+LLM_MODEL_FAST   = "gpt-4o-mini"
+LLM_MODEL_STRONG = "gpt-4o"
+LLM_TEMPERATURE  = 0
+
+# Miglioramento 5: soglie retrieval per topic
+MIN_SIMILARITY_BY_TOPIC: Dict[str, float] = {
+    "mansioni":             0.28,
+    "straordinari":         0.28,
+    "notturno_ordinario":   0.25,
+    "permessi":             0.22,
+    "rol_exfest":           0.22,
+    "malattia":             0.24,
+    "congedo_matrimoniale": 0.22,
+    "ferie":                0.22,
+    "tfr":                  0.22,
+    "maternita":            0.22,
+    "preavviso":            0.22,
+    "altro":                0.20,
+}
+MIN_AVG_TOP3       = 0.210
+MIN_SPREAD         = 0.018
+MIN_SELECTED_CHUNKS = 2
 
 
 # ============================================================
@@ -96,8 +105,8 @@ def get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
 
 
 UILCOM_PASSWORD = get_secret("UILCOM_PASSWORD")
-ADMIN_PASSWORD = get_secret("ADMIN_PASSWORD")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+ADMIN_PASSWORD  = get_secret("ADMIN_PASSWORD")
+OPENAI_API_KEY  = get_secret("OPENAI_API_KEY")
 
 
 # ============================================================
@@ -131,14 +140,14 @@ if UILCOM_PASSWORD:
                 st.session_state.auth_ok = False
                 st.error("Password non corretta.")
 else:
-    st.warning("Password iscritti non impostata. Imposta UILCOM_PASSWORD in Secrets (Streamlit) o variabile d’ambiente.")
+    st.warning("Password iscritti non impostata. Imposta UILCOM_PASSWORD in Secrets.")
 
 if not st.session_state.auth_ok:
     st.stop()
 
 
 # ============================================================
-# ADMIN MODE (debug)
+# ADMIN MODE
 # ============================================================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
@@ -151,7 +160,7 @@ if not OPENAI_API_KEY:
     st.error(
         "Manca la variabile **OPENAI_API_KEY**.\n\n"
         "Streamlit Cloud: **Settings → Secrets → OPENAI_API_KEY**\n"
-        "Locale: variabile d’ambiente OPENAI_API_KEY"
+        "Locale: variabile d'ambiente OPENAI_API_KEY"
     )
     st.stop()
 
@@ -162,21 +171,21 @@ if not OPENAI_API_KEY:
 def normalize_text_for_match(s: str) -> str:
     if not s:
         return ""
-    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    s = s.replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"')
     s = re.sub(r"\s+", " ", s)
     return s.lower()
 
 
 # ============================================================
-# CCNL: ESCLUSIONE PARTE SESTA (periodici/quotidiani)
+# CCNL: ESCLUSIONE PARTE SESTA
 # ============================================================
 def is_parte_sesta_chunk(text: str) -> bool:
     t = normalize_text_for_match(text or "")
     if "parte sesta" in t:
         return True
-    if ("giornali" in t and ("quotidiani" in t or "periodici" in t)):
+    if "giornali" in t and ("quotidiani" in t or "periodici" in t):
         return True
-    if ("aziende" in t and "editrici" in t and "stampatrici" in t):
+    if "aziende" in t and "editrici" in t and "stampatrici" in t:
         return True
     return False
 
@@ -197,7 +206,6 @@ def load_index(vec_path: str, meta_path: str) -> Tuple[np.ndarray, List[Dict[str
     vectors = np.load(vec_path)
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
-
     fixed: List[Dict[str, Any]] = []
     for item in meta:
         if isinstance(item, dict) and "text" in item and "page" in item:
@@ -237,7 +245,7 @@ def format_public_citations(source: str, pages: List[int]) -> str:
 
 
 def _tokenize_light(s: str) -> List[str]:
-    return re.findall(r"[a-zàèéìòù0-9]+", (s or "").lower())
+    return re.findall(r"[a-z\u00e0\u00e8\u00e9\u00ec\u00f2\u00f90-9]+", (s or "").lower())
 
 
 def _jaccard(a: List[str], b: List[str]) -> float:
@@ -284,202 +292,170 @@ def compute_retrieval_confidence(sim_values: List[float]) -> Dict[str, float]:
 
 
 # ============================================================
-# TRIGGERS / TOPIC
+# MIGLIORAMENTO 2: CROSS-ENCODER RERANKER
 # ============================================================
-MANSIONI_TRIGGERS = [
-    "mansioni superiori", "mansione superiore",
-    "categoria superiore", "livello superiore", "passaggio di categoria", "cambio categoria",
-    "inquadramento superiore", "differenza paga", "differenza di paga",
-    "trattamento corrispondente", "retribuzione corrispondente",
-    "30 giorni", "60 giorni", "diviene definitiva", "definitiva",
-    "sostituzione", "conservazione del posto",
-]
-
-PERMESSI_TRIGGERS = [
-    "permessi", "permesso", "assenze retribuite", "permessi retribuiti",
-    "visite mediche", "lutto", "matrimonio", "nozze", "studio", "esami",
-    "104", "assemblea", "sindac", "donazione", "rol", "ex festiv",
-    "rao",
-    "r.a.o",
-    "riposi annui",
-    "riposo annuo",
-    "riposo annuo (rao)",
-    "congedo matrimoniale", "congedo",
-]
-
-ROL_EXFEST_TRIGGERS = [
-    "rol", "r.o.l", "riduzione orario",
-    "ex festiv", "ex-festiv", "exfestiv",
-    "festività soppresse", "festivita soppresse",
-    "festività abolite", "festivita abolite",
-    "festività infrasettimanali abolite", "festivita infrasettimanali abolite",
-    "rao",
-    "r.a.o",
-    "riposi annui",
-    "riposo annuo",
-]
-
-MALATTIA_TRIGGERS = [
-    "malattia", "certificato", "inps",
-    "comporto", "prognosi", "ricaduta",
-    "visita fiscale", "reperibil", "fasce",
-]
-
-STRAORDINARI_TRIGGERS = [
-    "straordinario", "straordinari", "maggiorazione", "maggiorazioni",
-    "festivo", "feriale",
-]
-
-
-def is_mansioni_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in MANSIONI_TRIGGERS)
-
-
-def is_permessi_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in PERMESSI_TRIGGERS)
-
-
-def is_rol_exfest_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in ROL_EXFEST_TRIGGERS)
-
-
-def is_malattia_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in MALATTIA_TRIGGERS)
-
-
-def is_straordinario_question(q: str) -> bool:
-    ql = q.lower()
-    return any(t in ql for t in STRAORDINARI_TRIGGERS) or ("straordin" in ql)
-
-
-def is_straordinario_notturno_question(q: str) -> bool:
-    ql = q.lower()
-    return ("straordin" in ql) and ("notturn" in ql)
-
-
-def is_notturno_ordinario_question(q: str) -> bool:
-    ql = q.lower()
-    # NOTTURNO ORDINARIO: parla di notturno ma NON di straordinario
-    return ("notturn" in ql) and ("straordin" not in ql)
-
-
-# Alias per retrocompatibilità (stessa logica)
-is_lavoro_notturno_question = is_notturno_ordinario_question
-
-
-def is_congedo_matrimoniale_question(q: str) -> bool:
-    ql = q.lower()
-    return "congedo matrimoniale" in ql or ("matrimon" in ql) or ("nozze" in ql)
-
-
-def detect_topic(q: str) -> str:
-    ql = q.lower()
-    if is_malattia_question(ql):
-        return "malattia"
-    if is_mansioni_question(ql):
-        return "mansioni"
-    if is_rol_exfest_question(ql):
-        return "rol_exfest"
-    # ✅ Fix: congedo matrimoniale sta nel CCNL, non in IPZS — intercettarlo PRIMA di permessi
-    if is_congedo_matrimoniale_question(ql):
-        return "congedo_matrimoniale"
-    if is_permessi_question(ql):
-        return "permessi"
-    # ✅ prima intercettiamo il notturno ordinario
-    if is_notturno_ordinario_question(ql):
-        return "notturno_ordinario"
-    if is_straordinario_question(ql):
-        return "straordinari"
-    return "altro"
+def crossencoder_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not candidates:
+        return candidates
+    if CE_AVAILABLE:
+        try:
+            pairs = [(query, (c.get("text") or "")[:512]) for c in candidates]
+            scores = _CE_MODEL.predict(pairs)
+            idx = np.argsort(-np.array(scores))
+            return [candidates[int(i)] for i in idx]
+        except Exception:
+            pass
+    if BM25_AVAILABLE:
+        try:
+            corpus = [(c.get("text") or "").lower().split() for c in candidates]
+            bm25 = BM25Okapi(corpus)
+            scores = bm25.get_scores(query.lower().split())
+            idx = np.argsort(-np.array(scores))
+            return [candidates[int(i)] for i in idx]
+        except Exception:
+            pass
+    return candidates
 
 
 # ============================================================
-# MEMORIA BREVE (solo stesso topic)
+# MIGLIORAMENTO 1: TOPIC CLASSIFIER VIA LLM
 # ============================================================
-def build_enriched_question(current_q: str, current_topic: str) -> str:
-    if "messages" not in st.session_state:
-        return current_q.strip()
-    last_topic = st.session_state.get("last_topic", None)
-    if last_topic and last_topic != current_topic:
-        return current_q.strip()
-    user_msgs = [m["content"] for m in st.session_state.messages if m.get("role") == "user" and m.get("content")]
-    prev = user_msgs[:-1] if (user_msgs and user_msgs[-1].strip() == current_q.strip()) else user_msgs
-    last = prev[-MEMORY_USER_TURNS:] if prev else []
-    last = [x.strip() for x in last if x.strip()]
-    if not last:
-        return current_q.strip()
-    return (
-        "CONTESTO CONVERSAZIONE (ultime richieste utente, stesso argomento):\n"
-        + "\n".join([f"- {x}" for x in last])
-        + "\n\nDOMANDA ATTUALE:\n"
-        + current_q.strip()
-    )
+TOPIC_CLASSIFIER_PROMPT = """\
+Sei un classificatore di domande per un assistente contrattuale UILCOM IPZS (CCNL Grafici Editoria).
+Classifica la domanda in UNO dei seguenti topic:
+
+mansioni           - mansioni superiori, categoria superiore, passaggio livello, inquadramento
+straordinari       - lavoro straordinario, maggiorazioni straordinario feriale/notturno/festivo
+notturno_ordinario - lavoro notturno ordinario (NON straordinario notturno)
+permessi           - permessi retribuiti IPZS, lutto, visite mediche, studio, 104, assemblea, donazione sangue
+rol_exfest         - ROL, RAO, ex festività, festività soppresse/abolite, riposi annui
+malattia           - malattia, comporto, certificato, visita fiscale, reperibilità, INPS
+congedo_matrimoniale - congedo matrimoniale, permesso matrimonio, nozze
+ferie              - ferie, ferie annuali, periodo feriale, godimento ferie
+tfr                - TFR, trattamento fine rapporto, liquidazione, anticipazione TFR
+maternita          - maternità, paternità, congedo parentale, astensione obbligatoria/facoltativa
+preavviso          - preavviso, licenziamento, dimissioni, periodo di preavviso
+altro              - tutto il resto
+
+Rispondi SOLO con il nome esatto del topic (una parola dalla lista), nient'altro.
+Domanda: {q}
+"""
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def classify_topic_llm(q: str, api_key: str) -> str:
+    try:
+        llm = ChatOpenAI(model=LLM_MODEL_FAST, temperature=0, api_key=api_key)
+        result = llm.invoke(TOPIC_CLASSIFIER_PROMPT.format(q=q.strip())).content.strip().lower()
+        valid = {
+            "mansioni", "straordinari", "notturno_ordinario", "permessi", "rol_exfest",
+            "malattia", "congedo_matrimoniale", "ferie", "tfr", "maternita", "preavviso", "altro"
+        }
+        for token in re.split(r"[\s\n,\.]+", result):
+            if token in valid:
+                return token
+        return "altro"
+    except Exception:
+        return "altro"
+
+
+# ============================================================
+# SORGENTE PER TOPIC
+# ============================================================
+IPZS_TOPICS = {"permessi", "rol_exfest"}
+
+
+def topic_to_source(topic: str) -> str:
+    return "IPZS" if topic in IPZS_TOPICS else "CCNL"
+
+
+# ============================================================
+# MIGLIORAMENTO 4: DOMANDE COMPLESSE → GPT-4o
+# ============================================================
+def is_complex_question(q: str) -> bool:
+    q = q.strip()
+    if len(q.split()) > 20:
+        return True
+    if q.count("?") > 1:
+        return True
+    keywords = ["e inoltre", "ma anche", "in più", "oltre a", "combinat",
+                "differenza tra", "confronto", "rispetto a", "sia ... che"]
+    if any(x in q.lower() for x in keywords):
+        return True
+    return False
+
+
+def choose_model(q: str) -> str:
+    return LLM_MODEL_STRONG if is_complex_question(q) else LLM_MODEL_FAST
 
 
 # ============================================================
 # QUERY BUILDER
 # ============================================================
-def build_queries(q: str) -> List[str]:
+def build_queries(q: str, topic: str) -> List[str]:
     q0 = q.strip()
     qs = [q0, f"{q0} CCNL regola"]
 
-    if is_rol_exfest_question(q0):
-        qs += [
+    topic_queries: Dict[str, List[str]] = {
+        "rol_exfest": [
             "RAO festività infrasettimanali abolite riposi retribuiti",
             "ROL riduzione orario di lavoro maturazione fruizione monte ore",
-        ]
-    if is_permessi_question(q0) and (not is_rol_exfest_question(q0)):
-        qs += [
+        ],
+        "permessi": [
             "permessi retribuiti tipologie elenco",
             "permesso studio una settimana l'anno",
             "donazione sangue permesso retribuito",
             "legge 104 art 33 comma 3 permesso",
-        ]
-        # ✅ Fix: query specifiche per matrimonio/congedo matrimoniale
-        if any(x in q0.lower() for x in ["matrimon", "nozze", "congedo"]):
-            qs += [
-                "congedo matrimoniale giorni retribuiti",
-                "matrimonio permesso retribuito giorni",
-                "permesso matrimonio nozze CCNL IPZS",
-            ]
-
-    if topic == "congedo_matrimoniale" or is_congedo_matrimoniale_question(q0):
-        qs += [
-            "congedo matrimoniale giorni retribuiti CCNL",
-            "matrimonio permesso retribuito giorni lavorativi",
-            "congedo matrimoniale grafici editoria",
-        ]
-    if is_malattia_question(q0):
-        qs += [
+        ],
+        "malattia": [
             "malattia trattamento economico integrazione",
             "malattia periodo di comporto conservazione posto",
             "malattia visite fiscali reperibilità fasce",
-        ]
-    if is_straordinario_question(q0):
-        qs += [
-            "lavoro straordinario maggiorazioni",
+        ],
+        "straordinari": [
+            "lavoro straordinario maggiorazioni percentuale",
             "straordinario diurno maggiorazione 35",
             "straordinario notturno maggiorazione 60",
             "straordinario festivo maggiorazione 60",
-            "straordinario grafici editoria maggiorazione 35 60",
-        ]
-    if is_notturno_ordinario_question(q0):
-        qs += [
+        ],
+        "notturno_ordinario": [
             "lavoro notturno ordinario maggiorazione percentuale",
             "lavoro notturno turni maggiorazione CCNL grafici",
-            "indennità o maggiorazione lavoro notturno (non straordinario)",
-        ]
-    if is_mansioni_question(q0):
-        qs += [
+            "indennità maggiorazione lavoro notturno non straordinario",
+        ],
+        "mansioni": [
             "mansioni superiori 30 giorni consecutivi 60 giorni non consecutivi",
-            "mansioni superiori trattamento corrispondente all'attività svolta",
+            "mansioni superiori trattamento corrispondente attività svolta",
             "sostituzione lavoratore assente conservazione del posto",
-            "ha diritto al trattamento corrispondente all’attività svolta 30 giorni 60 giorni non si applica sostituzione conservazione del posto",
-        ]
+        ],
+        "congedo_matrimoniale": [
+            "congedo matrimoniale giorni retribuiti CCNL",
+            "matrimonio permesso retribuito giorni lavorativi",
+            "congedo matrimoniale grafici editoria",
+        ],
+        "ferie": [
+            "ferie annuali giorni spettanti maturazione CCNL",
+            "ferie godimento periodo feriale",
+            "ferie non godute monetizzazione cessazione",
+        ],
+        "tfr": [
+            "trattamento fine rapporto aliquota calcolo rivalutazione",
+            "TFR anticipazione condizioni acquisto casa",
+            "liquidazione TFR fondo pensione complementare",
+        ],
+        "maternita": [
+            "maternità astensione obbligatoria mesi retribuzione integrazione",
+            "congedo parentale facoltativo mesi indennità",
+            "paternità obbligatoria giorni retribuiti",
+        ],
+        "preavviso": [
+            "preavviso licenziamento dimissioni durata livello anzianità",
+            "periodo preavviso categoria contratto grafici",
+            "indennità sostitutiva preavviso",
+        ],
+    }
+
+    qs += topic_queries.get(topic, [])
 
     out, seen = [], set()
     for x in qs:
@@ -495,11 +471,10 @@ def build_queries(q: str) -> List[str]:
 # ============================================================
 def extract_key_evidence(chunks: List[Dict[str, Any]], source: str) -> List[str]:
     patterns = [
-        r"\b30\b", r"\b60\b",
-        r"mansioni?\s+superiori?", r"trattamento\s+corrispondente",
+        r"\b30\b", r"\b60\b", r"mansioni?\s+superiori?", r"trattamento\s+corrispondente",
         r"straordin", r"maggiorazion", r"\b35%\b", r"\b60%\b", r"\b40%\b", r"\b80%\b",
-        r"parte\s+sesta", r"quotidiani", r"periodici",
-        r"\brao\b", r"\brol\b",
+        r"parte\s+sesta", r"quotidiani", r"periodici", r"\brao\b", r"\brol\b",
+        r"ferie", r"\btfr\b", r"preavviso", r"maternit", r"congedo\s+matrimoniale",
     ]
     evidences: List[str] = []
     for c in chunks:
@@ -521,112 +496,62 @@ def extract_key_evidence(chunks: List[Dict[str, Any]], source: str) -> List[str]
 
 
 # ============================================================
-# OPTIONAL BM25 RERANK
-# ============================================================
-def bm25_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not BM25_AVAILABLE or not candidates:
-        return candidates
-    corpus = [(c.get("text") or "").lower().split() for c in candidates]
-    bm25 = BM25Okapi(corpus)
-    scores = bm25.get_scores(query.lower().split())
-    idx = np.argsort(-np.array(scores))
-    return [candidates[int(i)] for i in idx]
-
-
-# ============================================================
-# GUARDRAIL: MANSIONI SUPERIORI (deterministico)
+# GUARDRAIL: MANSIONI SUPERIORI
 # ============================================================
 def extract_mansioni_rules(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
     txt_all = " ".join([normalize_text_for_match(c.get("text") or "") for c in chunks])
-
-    found_30 = re.search(r"\b30\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
-    found_60 = re.search(r"\b60\b", txt_all) is not None and re.search(r"(giorn|gg)", txt_all) is not None
-
-    has_trattamento = re.search(
-        r"ha\s+diritto\s+al\s+trattamento\s+corrispondente|trattamento\s+corrispondente",
-        txt_all
-    ) is not None
-
-    has_esclusione = re.search(
-        r"non\s+si\s+applica.*sostituzion|sostituzion.*conservazion|diritto.*conservazion.*posto",
-        txt_all
-    ) is not None
-
-    has_formazione = (re.search(r"formazion|addestramento|affiancamento", txt_all) is not None) and (re.search(r"non\s+costituisc", txt_all) is not None)
-
+    found_30 = bool(re.search(r"\b30\b", txt_all) and re.search(r"(giorn|gg)", txt_all))
+    found_60 = bool(re.search(r"\b60\b", txt_all) and re.search(r"(giorn|gg)", txt_all))
+    has_trattamento = bool(re.search(r"ha\s+diritto\s+al\s+trattamento\s+corrispondente|trattamento\s+corrispondente", txt_all))
+    has_esclusione = bool(re.search(r"non\s+si\s+applica.*sostituzion|sostituzion.*conservazion|diritto.*conservazion.*posto", txt_all))
+    has_formazione = bool(re.search(r"formazion|addestramento|affiancamento", txt_all) and re.search(r"non\s+costituisc", txt_all))
     pages = set()
     for c in chunks:
         try:
             pages.add(int(c.get("page", 0)))
         except Exception:
             pass
-
     return {
-        "found_30": found_30,
-        "found_60": found_60,
-        "has_trattamento": has_trattamento,
-        "has_esclusione": has_esclusione,
-        "has_formazione": has_formazione,
-        "pages": sorted([p for p in pages if p]),
+        "found_30": found_30, "found_60": found_60,
+        "has_trattamento": has_trattamento, "has_esclusione": has_esclusione,
+        "has_formazione": has_formazione, "pages": sorted([p for p in pages if p]),
     }
 
 
 def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
     ql = user_q.lower()
-
     ask_stabilizzazione = any(x in ql for x in [
         "categoria", "livello", "passaggio", "inquadramento", "definitiv",
         "stabilizz", "30", "60", "giorni", "matur", "diviene definitiva"
     ])
     ask_trattamento = any(x in ql for x in ["differenza", "paga", "pagato", "trattamento", "retribuzione"])
-
-    diff_paga = rules.get("has_trattamento", False)
-    has_30_60 = bool(rules.get("found_30", False) and rules.get("found_60", False))
-
+    has_30_60 = bool(rules.get("found_30") and rules.get("found_60"))
     parts: List[str] = []
 
     if ask_trattamento:
-        # ✅ Regola chiave: svolgere mansioni superiori dà diritto al trattamento corrispondente (differenza retributiva)
         parts.append(
-            "Se vieni assegnato a **mansioni superiori**, hai diritto al **trattamento corrispondente all’attività svolta** "
+            "Se vieni assegnato a **mansioni superiori**, hai diritto al **trattamento corrispondente all'attività svolta** "
             "(cioè alla **differenza retributiva** per i giorni/periodi in cui svolgi quelle mansioni)."
         )
 
-    if ask_stabilizzazione:
-        if has_30_60:
+    if ask_stabilizzazione or not parts:
+        note = "" if has_30_60 else "\n\n*(Regola da CCNL — verifica la pagina esatta nella tua copia del contratto.)*"
+        parts.append(
+            "La categoria/livello superiore **matura** (diventa definitivo) dopo:\n"
+            "- **30 giorni consecutivi** di mansioni superiori;\n"
+            "- **60 giorni complessivi**, anche non continuativi." + note
+        )
+        if rules.get("has_esclusione"):
             parts.append(
-                "La categoria/livello superiore **matura** (diventa definitivo) dopo:\n"
-                "- **30 giorni consecutivi** di mansioni superiori;\n"
-                "- **60 giorni complessivi**, anche non continuativi."
-            )
-        else:
-            # ✅ Fix: anche senza conferma dal retrieval, la regola 30/60 è nota e hardcoded.
-            parts.append(
-                "La categoria/livello superiore **matura** (diventa definitivo) dopo:\n"
-                "- **30 giorni consecutivi** di mansioni superiori;\n"
-                "- **60 giorni complessivi**, anche non continuativi.\n\n"
-                "*(Regola da CCNL — verifica la pagina esatta nella tua copia del contratto.)*"
-            )
-
-        if rules.get("has_esclusione", False):
-            parts.append(
-                "⚠️ **Eccezione:** la maturazione/definitività **non opera** se l’assegnazione avviene per **sostituzione** "
+                "⚠️ **Eccezione:** la maturazione **non opera** se l'assegnazione avviene per **sostituzione** "
                 "di un dipendente assente con **diritto alla conservazione del posto**."
             )
 
-    if rules.get("has_formazione", False):
+    if rules.get("has_formazione"):
         parts.append(
-            "ℹ️ **Nota:** la **formazione/addestramento in affiancamento** con personale di categoria superiore "
+            "ℹ️ La **formazione/addestramento in affiancamento** con personale di categoria superiore "
             "non è considerata assegnazione a mansioni superiori."
         )
-
-    if not parts:
-        if diff_paga and has_30_60:
-            parts.append("Per mansioni superiori: trattamento corrispondente + possibile maturazione del livello dopo 30 giorni consecutivi o 60 complessivi.")
-        elif diff_paga:
-            parts.append("Per mansioni superiori: trattamento corrispondente all’attività svolta.")
-        else:
-            parts.append("Non ho trovato la risposta nei documenti caricati.")
 
     cit = format_public_citations("CCNL", rules.get("pages", []) or [])
     if cit:
@@ -635,115 +560,151 @@ def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
 
 
 # ============================================================
-# GUARDRAIL: STRAORDINARI IPZS (deterministico)
+# GUARDRAIL: STRAORDINARI
 # ============================================================
-def straordinari_ipzs_public_answer(user_q: str, cc_pages: List[int]) -> str:
+def straordinari_public_answer(user_q: str, cc_pages: List[int]) -> str:
     ql = user_q.lower()
-
-    lines: List[str] = []
-    lines.append("Per lo **straordinario** (CCNL Grafici-Editoriali), le maggiorazioni sono in genere così articolate:")
-
+    lines = ["Per lo **straordinario** (CCNL Grafici-Editoriali), le maggiorazioni sono:"]
     if "ferial" in ql and "festiv" not in ql and "notturn" not in ql:
         lines.append("- **Straordinario feriale (diurno):** **35%**")
     else:
         lines.append("- **Straordinario diurno:** **35%**")
         lines.append("- **Straordinario notturno:** **60%**")
         lines.append("- **Straordinario festivo:** **60%**")
-
     lines.append(
-        "ℹ️ Nota: le maggiorazioni del **40%** e **80%** previste dal CCNL riguardano esclusivamente la "
+        "ℹ️ Le maggiorazioni del **40%** e **80%** riguardano esclusivamente la "
         "**Parte Sesta** (aziende editrici e stampatrici di giornali quotidiani e periodici)."
     )
-
     cit = format_public_citations("CCNL", cc_pages or [])
     if cit:
         lines.append(cit)
     return "\n".join(lines).strip()
 
 
+# ============================================================
+# MIGLIORAMENTO 3: GUARDRAIL ESTESI
+# ============================================================
+def ferie_public_answer(cc_pages: List[int]) -> str:
+    lines = [
+        "Riguardo alle **ferie** (CCNL Grafici-Editoriali):",
+        "- I lavoratori maturano **ferie annuali retribuite** come previsto dal CCNL (minimo **4 settimane/anno** per legge).",
+        "- Le ferie devono essere godute preferibilmente nell'anno di maturazione; la parte eccedente le 2 settimane può essere rinviata entro 18 mesi.",
+        "- Le ferie **non possono essere sostituite da indennità** durante il rapporto di lavoro (salvo alla cessazione).",
+        "- In caso di malattia insorta durante le ferie, verifica se il CCNL prevede la sospensione del periodo feriale.",
+        "ℹ️ Per i dettagli esatti (durata per anzianità, periodi, deroghe aziendali) consulta il CCNL o RSU/UILCOM.",
+    ]
+    cit = format_public_citations("CCNL", cc_pages or [])
+    if cit:
+        lines.append(cit)
+    return "\n".join(lines).strip()
+
+
+def tfr_public_answer(cc_pages: List[int]) -> str:
+    lines = [
+        "Riguardo al **TFR (Trattamento di Fine Rapporto)**:",
+        "- Si calcola dividendo la retribuzione annua utile per **13,5** e rivalutando ogni anno al **75% dell'inflazione ISTAT + 1,5% fisso**.",
+        "- Puoi richiedere un'**anticipazione** (fino al 70%) dopo almeno **8 anni di servizio**, per spese sanitarie o acquisto prima casa.",
+        "- Il TFR può essere destinato a un **fondo pensione complementare** (scelta entro 6 mesi dall'assunzione o con destinazione tacita).",
+        "ℹ️ Per l'importo preciso e le condizioni IPZS, contatta RSU/UILCOM.",
+    ]
+    cit = format_public_citations("CCNL", cc_pages or [])
+    if cit:
+        lines.append(cit)
+    return "\n".join(lines).strip()
+
+
+def maternita_public_answer(cc_pages: List[int]) -> str:
+    lines = [
+        "Riguardo a **maternità e congedo parentale** (D.Lgs. 151/2001 + CCNL):",
+        "- **Astensione obbligatoria (maternità):** 5 mesi (2 ante-parto + 3 post-parto), con **indennità INPS all'80%** + eventuale integrazione CCNL al 100%.",
+        "- **Congedo parentale:** fino a **6 mesi** per genitore (10 mesi totali coppia) entro i 12 anni del figlio, indennizzato al 30% (o 80% per il primo mese).",
+        "- **Paternità obbligatoria:** **10 giorni** di congedo obbligatorio retribuito al 100%.",
+        "ℹ️ Verifica eventuali integrazioni previste dal CCNL o da accordi aziendali IPZS.",
+    ]
+    cit = format_public_citations("CCNL", cc_pages or [])
+    if cit:
+        lines.append(cit)
+    return "\n".join(lines).strip()
+
+
+def preavviso_public_answer(cc_pages: List[int]) -> str:
+    lines = [
+        "Riguardo al **preavviso** (CCNL Grafici-Editoriali):",
+        "- La durata varia in base alla **categoria/livello** e all'**anzianità di servizio**.",
+        "- In mancanza di preavviso, chi recede paga un'**indennità sostitutiva** pari alle retribuzioni del periodo.",
+        "- Il **licenziamento per giusta causa** non richiede preavviso.",
+        "ℹ️ Per la durata esatta in base al tuo livello, consulta il CCNL o RSU/UILCOM.",
+    ]
+    cit = format_public_citations("CCNL", cc_pages or [])
+    if cit:
+        lines.append(cit)
+    return "\n".join(lines).strip()
+
+
+def congedo_matrimoniale_public_answer(cc_pages: List[int]) -> str:
+    lines = [
+        "Riguardo al **congedo matrimoniale** (CCNL Grafici-Editoriali):",
+        "- Il lavoratore ha diritto a un periodo di **congedo retribuito** per matrimonio.",
+        "- In genere il CCNL Grafici Editoria prevede **15 giorni** di congedo matrimoniale retribuito.",
+        "ℹ️ Verifica la durata esatta nel testo del CCNL o contatta RSU/UILCOM per conferma.",
+    ]
+    cit = format_public_citations("CCNL", cc_pages or [])
+    if cit:
+        lines.append(cit)
+    return "\n".join(lines).strip()
 
 
 # ============================================================
-# NOTTURNO ORDINARIO: ESTRAZIONE PERCENTUALI (anche "per cento"/"percento")
+# FULLSCAN NOTTURNO ORDINARIO
 # ============================================================
-def extract_notturno_ordinario_percentuali(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Estrae percentuali e righe rilevanti sul lavoro notturno ordinario dai chunk CCNL.
-    Supporta anche formati tipo "20 per cento" / "20 percento" oltre a "20%".
-    Evita di confondere con percentuali tipiche dello straordinario/Parte Sesta.
-    """
-    lines_hit: List[str] = []
-    perc: List[str] = []
-
-    for c in chunks:
-        page = c.get("page", "?")
+def fullscan_notturno_ordinario(meta_all: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for c in meta_all:
         txt = c.get("text", "") or ""
-        for ln in [x.strip() for x in txt.splitlines() if x.strip()]:
-            lnl = ln.lower()
-
-            # deve parlare di notturno, ma NON di straordinario
-            if re.search(r"not\s*-?\s*turn", lnl) and ("straordin" not in lnl):
-                lines_hit.append(f"(pag. {page}) " + " ".join(ln.split()))
-
-                # cattura percentuali: "20%", "20 per cento", "20 percento"
-                matches: List[str] = []
-                matches += re.findall(r"\b(\d{1,2})\s*%\b", ln)
-                matches += re.findall(r"\b(\d{1,2})\s*(?:per\s*cento|percento)\b", ln, flags=re.IGNORECASE)
-
-                for m in matches:
-                    # escludi percentuali tipiche dello straordinario/parte sesta per evitare confusioni
-                    if m in ("35", "60", "40", "80"):
-                        continue
-                    perc.append(m + "%")
-
-    # dedup preservando ordine
-    perc_out: List[str] = []
-    seen = set()
-    for p in perc:
-        if p not in seen:
-            perc_out.append(p)
-            seen.add(p)
-
-    return {"percentuali": perc_out, "righe": lines_hit[:10]}
+        t = normalize_text_for_match(txt)
+        if re.search(r"not\s*-?\s*turn", t) and "%" in txt and "straordin" not in t:
+            if is_parte_sesta_chunk(txt):
+                continue
+            out.append(c)
+    return _dedup_near_identical(out)[:40]
 
 
 # ============================================================
-# SYSTEM RULES (LLM) — tono più “sindacale”
+# SYSTEM RULES LLM — risposta JSON strutturata (Miglioramento 7)
 # ============================================================
 RULES_PUBLIC = """
-Sei l’assistente UILCOM per lavoratori IPZS.
-Rispondi in italiano naturale, chiaro e pratico (tono sindacale: “cosa spetta / cosa verificare / cosa fare”),
-basandoti SOLO sul contesto fornito (estratti dai documenti indicizzati). Non inventare informazioni.
+Sei l'assistente UILCOM per lavoratori IPZS (CCNL Grafici Editoria).
+Rispondi in italiano naturale, chiaro e pratico (tono sindacale: "cosa spetta / cosa verificare / cosa fare"),
+basandoti SOLO sul contesto fornito. Non inventare informazioni.
 
-REGOLE IMPORTANTI:
-1) Se non trovi nel contesto, scrivi: "Non ho trovato la risposta nei documenti caricati."
-2) NON confondere lavoro notturno (ordinario) con straordinario notturno.
-3) EX FESTIVITÀ: se trovi "festività soppresse/abolite/infrasettimanali abolite", spiega che è la dicitura equivalente.
-4) Permessi: elenca SOLO le tipologie che trovi nel contesto.
-5) Chiudi SEMPRE con una riga fonte:
-   - "Fonte: CCNL (pag. ...)" oppure "Fonte: IPZS Permessi (scheda ...)".
+REGOLE:
+1) Se non trovi risposta nel contesto: risposta = "Non ho trovato la risposta nei documenti caricati."
+2) NON confondere lavoro notturno ordinario con straordinario notturno.
+3) EX FESTIVITÀ = festività soppresse/abolite/infrasettimanali abolite (sono la stessa cosa).
+4) Permessi: elenca SOLO le tipologie presenti nel contesto.
+5) confidenza: "alta" = risposta chiara nel contesto | "media" = parziale | "bassa" = inferita/non trovata.
+6) avvertenza: aggiungi solo se utile (es. contattare RSU per casi complessi).
+7) STRAORDINARI: se vedi 40%/80% o "Parte Sesta/quotidiani/periodici", segnalalo come settore diverso.
 
-ATTENZIONE STRAORDINARI:
-- Se nel contesto compaiono 40%/80% o riferimenti a "Parte Sesta / quotidiani / periodici", segnalalo come parte dedicata a quel settore, senza applicarla automaticamente.
+FORMATO — rispondi ESCLUSIVAMENTE con questo JSON valido (nessun testo fuori):
+{
+  "risposta": "testo risposta in markdown",
+  "fonte": "es. CCNL pag. 45 oppure IPZS Permessi scheda 3",
+  "confidenza": "alta|media|bassa",
+  "avvertenza": "testo avvertenza oppure stringa vuota"
+}
 """
 
 
-
-
 # ============================================================
-# IPZS: ESTRAZIONE TITOLI PERMESSI (per elenco completo)
+# IPZS: ESTRAZIONE TITOLI PERMESSI
 # ============================================================
 def extract_ipzs_permessi_titles_from_file(path: str) -> List[str]:
-    """
-    Estrae i titoli delle voci permessi dal file IPZS (titoli in maiuscolo seguiti da linea ----).
-    Serve per dare all'utente l'elenco completo quando chiede "tutti i permessi" / "lista permessi".
-    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             txt = f.read().replace("\r\n", "\n")
     except Exception:
         return []
-
     lines = [ln.rstrip() for ln in txt.split("\n")]
     titles: List[str] = []
     for i in range(len(lines) - 1):
@@ -757,9 +718,7 @@ def extract_ipzs_permessi_titles_from_file(path: str) -> List[str]:
             if title.upper() != title:
                 continue
             titles.append(title)
-
-    out: List[str] = []
-    seen = set()
+    out, seen = [], set()
     for t in titles:
         if t not in seen:
             out.append(t)
@@ -778,16 +737,14 @@ def is_lista_permessi_question(q: str) -> bool:
 
 
 # ============================================================
-# IPZS TXT SPLIT (schede)
+# IPZS TXT SPLIT
 # ============================================================
 def split_ipzs_blocks(raw_txt: str) -> List[str]:
     txt = (raw_txt or "").replace("\r\n", "\n")
     lines = txt.split("\n")
-
-    sep_idx = [i for i, ln in enumerate(lines) if re.fullmatch(r"[\-\=\*]{5,}", ln.strip() or "") is not None]
+    sep_idx = [i for i, ln in enumerate(lines) if re.fullmatch(r"[\-\=\*]{5,}", (ln.strip() or "")) is not None]
     if len(sep_idx) >= 1:
-        blocks = []
-        start = 0
+        blocks, start = [], 0
         for i in sep_idx:
             block = "\n".join(lines[start:i]).strip()
             if len(block) >= 120:
@@ -798,32 +755,73 @@ def split_ipzs_blocks(raw_txt: str) -> List[str]:
             blocks.append(tail)
         if blocks:
             return blocks
-
     starts = []
     for i, ln in enumerate(lines):
         s = (ln or "").strip()
         if not s:
             continue
-        if 4 <= len(s) <= 90 and re.fullmatch(r"[A-Z0-9ÀÈÉÌÒÙ\.\-\/\(\)\s]+", s) is not None:
+        if 4 <= len(s) <= 90 and re.fullmatch(r"[A-Z0-9\u00C0-\u00DC\.\-\/\(\)\s]+", s) is not None:
             nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
             nxt2 = lines[i + 2].strip() if i + 2 < len(lines) else ""
-            cond = (nxt == "") or (nxt and re.fullmatch(r"[A-Z0-9ÀÈÉÌÒÙ\.\-\/\(\)\s]+", nxt) is None)
+            cond = (nxt == "") or (nxt and re.fullmatch(r"[A-Z0-9\u00C0-\u00DC\.\-\/\(\)\s]+", nxt) is None)
             cond = cond or (nxt == "" and nxt2 != "")
             if cond:
                 starts.append(i)
-
     if len(starts) >= 2:
         blocks = []
         for k in range(len(starts)):
-            a = starts[k]
-            b = starts[k + 1] if k + 1 < len(starts) else len(lines)
+            a, b = starts[k], starts[k + 1] if k + 1 < len(starts) else len(lines)
             block = "\n".join(lines[a:b]).strip()
             if len(block) >= 120:
                 blocks.append(block)
         if blocks:
             return blocks
-
     return [txt.strip()]
+
+
+# ============================================================
+# MIGLIORAMENTO 6: MEMORIA CONVERSAZIONALE MIGLIORATA
+# ============================================================
+def build_enriched_question(current_q: str, current_topic: str) -> str:
+    """
+    Includi gli ultimi MEMORY_FULL_TURNS turni completi (domanda + risposta).
+    Azzera la memoria solo se il topic cambia (evita contaminazioni).
+    """
+    if "messages" not in st.session_state:
+        return current_q.strip()
+
+    last_topic = st.session_state.get("last_topic", None)
+    if last_topic and last_topic != current_topic:
+        return current_q.strip()
+
+    messages = st.session_state.messages
+    pairs: List[str] = []
+    i = len(messages) - 1
+    turns = 0
+    while i >= 0 and turns < MEMORY_FULL_TURNS:
+        msg = messages[i]
+        if msg.get("role") == "assistant":
+            assistant_content = (msg.get("content") or "").strip()
+            if i > 0 and messages[i - 1].get("role") == "user":
+                user_content = (messages[i - 1].get("content") or "").strip()
+                if user_content != current_q.strip():
+                    pairs.insert(0, f"Utente: {user_content}\nAssistente: {assistant_content[:400]}")
+                    turns += 1
+                i -= 2
+            else:
+                i -= 1
+        else:
+            i -= 1
+
+    if not pairs:
+        return current_q.strip()
+
+    return (
+        "CONTESTO CONVERSAZIONE (ultimi scambi, stesso argomento):\n"
+        + "\n---\n".join(pairs)
+        + "\n\nDOMANDA ATTUALE:\n"
+        + current_q.strip()
+    )
 
 
 # ============================================================
@@ -844,10 +842,9 @@ with st.sidebar:
             if st.button("Logout", use_container_width=True):
                 st.session_state.is_admin = False
     else:
-        st.caption("ADMIN_PASSWORD non impostata (Secrets).")
+        st.caption("ADMIN_PASSWORD non impostata.")
 
     st.divider()
-
     st.subheader("📦 Indice CCNL")
     ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
     st.write("Indice presente:", "✅" if ok_index else "❌")
@@ -856,32 +853,25 @@ with st.sidebar:
         try:
             with st.spinner("Indicizzazione CCNL in corso..."):
                 if not os.path.exists(PDF_PATH):
-                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH} (metti ccnl.pdf in /documenti)")
+                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH}")
                 os.makedirs(INDEX_DIR, exist_ok=True)
-
                 loader = PyPDFLoader(PDF_PATH)
                 docs = loader.load()
-
                 splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
                 chunks = splitter.split_documents(docs)
-
                 texts = [c.page_content for c in chunks]
                 pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]
-
-                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors = np.array(emb.embed_documents(texts), dtype=np.float32)
-
+                emb_idx = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                vectors = np.array(emb_idx.embed_documents(texts), dtype=np.float32)
                 np.save(VEC_PATH, vectors)
                 with open(META_PATH, "w", encoding="utf-8") as f:
                     json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
-
             st.success(f"Indicizzazione CCNL completata. Chunk: {len(chunks)}")
             st.rerun()
         except Exception as e:
             st.error(str(e))
 
     st.divider()
-
     st.subheader("📦 Indice IPZS (permessi)")
     ok_ipzs = os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)
     st.write("Indice IPZS presente:", "✅" if ok_ipzs else "❌")
@@ -890,42 +880,36 @@ with st.sidebar:
         try:
             with st.spinner("Indicizzazione IPZS in corso..."):
                 if not os.path.exists(IPZS_TXT_PATH):
-                    raise FileNotFoundError(f"Non trovo il file: {IPZS_TXT_PATH} (metti il TXT in /documenti)")
+                    raise FileNotFoundError(f"Non trovo il file: {IPZS_TXT_PATH}")
                 os.makedirs(INDEX_DIR_IPZS, exist_ok=True)
-
                 with open(IPZS_TXT_PATH, "r", encoding="utf-8") as f:
                     raw_txt = f.read()
-
                 blocks = split_ipzs_blocks(raw_txt)
                 splitter = RecursiveCharacterTextSplitter(chunk_size=IPZS_CHUNK_SIZE, chunk_overlap=IPZS_CHUNK_OVERLAP)
-
-                chunks: List[Dict[str, Any]] = []
-                scheda = 0
-                for b in blocks:
-                    scheda += 1
-                    parts = splitter.split_text(b)
-                    for p in parts:
-                        chunks.append({"page": scheda, "text": p})
-
-                texts = [c["text"] for c in chunks]
-                emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors_ipzs = np.array(emb.embed_documents(texts), dtype=np.float32)
-
+                chunks_ipzs: List[Dict[str, Any]] = []
+                for scheda, b in enumerate(blocks, 1):
+                    for p in splitter.split_text(b):
+                        chunks_ipzs.append({"page": scheda, "text": p})
+                texts_ipzs = [c["text"] for c in chunks_ipzs]
+                emb_idx = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+                vectors_ipzs = np.array(emb_idx.embed_documents(texts_ipzs), dtype=np.float32)
                 np.save(VEC_PATH_IPZS, vectors_ipzs)
                 with open(META_PATH_IPZS, "w", encoding="utf-8") as f:
-                    json.dump(chunks, f, ensure_ascii=False)
-
-            st.success(f"Indicizzazione IPZS completata. Schede: {len(blocks)} — Chunk: {len(chunks)}")
+                    json.dump(chunks_ipzs, f, ensure_ascii=False)
+            st.success(f"Indicizzazione IPZS completata. Schede: {len(blocks)} — Chunk: {len(chunks_ipzs)}")
             st.rerun()
         except Exception as e:
             st.error(str(e))
 
     st.divider()
-
     if st.button("🧹 Nuova chat", use_container_width=True):
         st.session_state.messages = []
         st.session_state.last_topic = None
         st.rerun()
+
+    st.divider()
+    st.caption(f"Veloce: `{LLM_MODEL_FAST}` | Potente: `{LLM_MODEL_STRONG}`")
+    st.caption(f"Cross-encoder: {'✅' if CE_AVAILABLE else '❌ (BM25 fallback)'}")
 
 
 # ============================================================
@@ -947,40 +931,44 @@ for m in st.session_state.messages:
 # ============================================================
 # CHAT INPUT
 # ============================================================
-user_input = st.chat_input("Scrivi una domanda (permessi, ROL/RAO, malattia, straordinari, mansioni superiori...)")
+user_input = st.chat_input("Scrivi una domanda (permessi, ROL/RAO, malattia, straordinari, mansioni, ferie, TFR...)")
 if not user_input:
     st.stop()
 
 st.session_state.messages.append({"role": "user", "content": user_input})
+with st.chat_message("user"):
+    st.markdown(user_input)
 
 
 # ============================================================
-# SCEGLI SORGENTE
+# MIGLIORAMENTO 1: CLASSIFICAZIONE TOPIC VIA LLM
 # ============================================================
-topic = detect_topic(user_input)
-# ✅ Forza corretta classificazione: se c'è "straordinario" non deve finire su IPZS/permessi
+with st.spinner("Analizzo la domanda..."):
+    topic = classify_topic_llm(user_input, OPENAI_API_KEY)
+
+# Override sicurezza
 if "straordin" in (user_input or "").lower():
     topic = "straordinari"
+
 enriched_q = build_enriched_question(user_input, topic)
+source = topic_to_source(topic)
 
-use_ipzs = topic in ("permessi", "rol_exfest")
-# ✅ Fix: congedo_matrimoniale usa CCNL anche se ha trigger simili ai permessi
-if topic == "congedo_matrimoniale":
-    use_ipzs = False
-source = "IPZS" if use_ipzs else "CCNL"
 
+# ============================================================
+# CHECK INDICE DISPONIBILE
+# ============================================================
 if source == "CCNL":
     if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
         st.session_state.messages.append({"role": "assistant", "content": "Prima devo indicizzare il CCNL: apri la barra laterale e clicca **Indicizza / Reindicizza CCNL**."})
         st.rerun()
 else:
     if not (os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)):
-        st.session_state.messages.append({"role": "assistant", "content": "Prima devo indicizzare le **schede IPZS (permessi)**: apri la barra laterale e clicca **Indicizza / Reindicizza IPZS (permessi)**."})
+        st.session_state.messages.append({"role": "assistant", "content": "Prima devo indicizzare le **schede IPZS**: apri la barra laterale e clicca **Indicizza / Reindicizza IPZS (permessi)**."})
         st.rerun()
 
 
 # ============================================================
-# RETRIEVAL (con filtro Parte Sesta su CCNL)
+# RETRIEVAL
 # ============================================================
 if source == "CCNL":
     vectors, meta = load_index(VEC_PATH, META_PATH)
@@ -989,27 +977,24 @@ else:
 
 mat_norm = normalize_rows(vectors)
 emb = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-
-queries = build_queries(enriched_q)
+queries = build_queries(enriched_q, topic)
 
 scores_best: Dict[int, float] = {}
 for q in queries:
     qvec = np.array(emb.embed_query(q), dtype=np.float32)
     sims = cosine_scores(qvec, mat_norm)
-    top_idx = np.argsort(-sims)[:TOP_K_PER_QUERY]
-    for i in top_idx:
+    for i in np.argsort(-sims)[:TOP_K_PER_QUERY]:
         idx = int(i)
         if source == "CCNL" and is_parte_sesta_chunk(meta[idx].get("text", "")):
             continue
         s = float(sims[idx])
-        if (idx not in scores_best) or (s > scores_best[idx]):
+        if idx not in scores_best or s > scores_best[idx]:
             scores_best[idx] = s
 
 ranked_idx = sorted(scores_best.keys(), key=lambda i: scores_best[i], reverse=True)
-
 candidates: List[Dict[str, Any]] = []
 cand_scores: List[float] = []
-for i in ranked_idx[: max(TOP_K_FINAL * 3, TOP_K_FINAL)]:
+for i in ranked_idx[:max(TOP_K_FINAL * 3, TOP_K_FINAL)]:
     candidates.append(meta[int(i)])
     cand_scores.append(float(scores_best[int(i)]))
 
@@ -1026,18 +1011,19 @@ for c, s in zip(candidates, cand_scores):
         break
 
 selected = _dedup_near_identical(tmp[:TOP_K_FINAL])
-selected_scores = tmp_scores[: len(selected)]
+selected_scores = tmp_scores[:len(selected)]
 
-# ✅ Fix: dopo bm25_rerank, riallinea i punteggi all'ordine effettivo
-_selected_pre_bm25 = list(selected)
-selected = bm25_rerank(enriched_q, selected)
-# ricostruisce selected_scores nell'ordine post-BM25
-_score_map = {id(c): s for c, s in zip(_selected_pre_bm25, selected_scores)}
+# MIGLIORAMENTO 2: cross-encoder rerank + riallinea scores
+_pre_rerank = list(selected)
+selected = crossencoder_rerank(enriched_q, selected)
+_score_map = {id(c): s for c, s in zip(_pre_rerank, selected_scores)}
 selected_scores = [_score_map.get(id(c), 0.0) for c in selected]
 
+# MIGLIORAMENTO 5: soglie per topic
+min_best = MIN_SIMILARITY_BY_TOPIC.get(topic, MIN_SIMILARITY_BY_TOPIC["altro"])
 confidence = compute_retrieval_confidence(selected_scores)
 retrieval_ok = (
-    confidence["best"] >= MIN_BEST_SIMILARITY
+    confidence["best"] >= min_best
     and confidence["avg_top3"] >= MIN_AVG_TOP3
     and confidence["spread"] >= MIN_SPREAD
     and len(selected) >= MIN_SELECTED_CHUNKS
@@ -1047,242 +1033,219 @@ key_evidence = extract_key_evidence(selected, source)
 public_pages = unique_pages(selected, max_pages=8)
 public_cit_line = format_public_citations(source, public_pages)
 
+
 def hard_not_found_message() -> str:
     return "Non ho trovato la risposta nei documenti caricati."
 
 
-
-
 # ============================================================
-# CCNL: FULL SCAN per NOTTURNO ORDINARIO (fallback se retrieval non pesca il chunk giusto)
-# ============================================================
-def fullscan_notturno_ordinario(meta_all: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Cerca in TUTTI i chunk del CCNL righe con:
-    - 'notturn' e '%'
-    - e NON 'straordin'
-    Esclude la Parte Sesta per evitare contaminazioni.
-    Ritorna una lista di chunk candidati (con pagina e testo).
-    """
-    out: List[Dict[str, Any]] = []
-    for c in meta_all:
-        txt = c.get("text", "") or ""
-        t = normalize_text_for_match(txt)
-
-        if re.search(r"not\s*-?\s*turn", t) and "%" in txt and ("straordin" not in t):
-            if is_parte_sesta_chunk(txt):
-                continue
-            out.append(c)
-
-    out = _dedup_near_identical(out)
-    return out[:40]
-
-
-# ============================================================
-# ROUTING: GUARDRAIL TOPIC
+# ROUTING: GUARDRAIL TOPIC (if / elif / else)
 # ============================================================
 if topic == "mansioni":
-    if source != "CCNL":
-        st.session_state.messages.append({"role": "assistant", "content": "Questa domanda riguarda **mansioni superiori**: la tratto sul **CCNL**. Indicizza il CCNL e riprova."})
-        st.rerun()
-
     if retrieval_ok:
         rules_m = extract_mansioni_rules(selected)
-        if not rules_m.get("has_trattamento", False):
-            extra_q = "ha diritto al trattamento corrispondente all’attività svolta mansioni superiori 30 giorni 60 giorni non si applica sostituzione conservazione del posto"
+        if not rules_m.get("has_trattamento"):
+            extra_q = "ha diritto al trattamento corrispondente all'attività svolta mansioni superiori 30 giorni 60 giorni"
             qvec2 = np.array(emb.embed_query(extra_q), dtype=np.float32)
             sims2 = cosine_scores(qvec2, mat_norm)
-            top2 = np.argsort(-sims2)[:10]
-            extra = []
-            for ii in top2:
-                idx2 = int(ii)
-                if is_parte_sesta_chunk(meta[idx2].get("text", "")):
-                    continue
-                extra.append(meta[idx2])
-            extra = _limit_per_page(_dedup_near_identical(extra), max_per_page=2)
-            selected2 = _dedup_near_identical(selected + extra)
-            rules_m = extract_mansioni_rules(selected2)
-
-        public_ans = mansioni_public_answer(user_input, rules_m)
+            extra = [meta[int(ii)] for ii in np.argsort(-sims2)[:10] if not is_parte_sesta_chunk(meta[int(ii)].get("text", ""))]
+            rules_m = extract_mansioni_rules(_dedup_near_identical(selected + _limit_per_page(_dedup_near_identical(extra), 2)))
     else:
-        # ✅ Fallback deterministico: retrieval debole ma la regola 30/60 è nota,
-        # impostiamo tutti i flag a True per restituire la risposta hardcoded completa.
-        rules_m = {"has_trattamento": True, "found_30": True, "found_60": True, "has_esclusione": False, "has_formazione": False, "pages": public_pages}
-        public_ans = mansioni_public_answer(user_input, rules_m)
+        rules_m = {"has_trattamento": True, "found_30": True, "found_60": True,
+                   "has_esclusione": False, "has_formazione": False, "pages": public_pages}
 
-    payload = {"role": "assistant", "content": public_ans}
+    public_ans = mansioni_public_answer(user_input, rules_m)
+    payload: Dict[str, Any] = {"role": "assistant", "content": public_ans}
     if st.session_state.is_admin:
-        payload["debug"] = {
-            "topic": topic,
-            "queries": queries,
-            "confidence": confidence,
-            "evidence": key_evidence,
-            "pages": rules_m.get("pages") if isinstance(rules_m, dict) else None,
-        }
-
+        payload["debug"] = {"topic": topic, "model": "deterministico", "queries": queries,
+                            "confidence": confidence, "evidence": key_evidence, "pages": rules_m.get("pages")}
     st.session_state.last_topic = topic
     st.session_state.messages.append(payload)
     st.rerun()
-
 
 elif topic == "straordinari":
-    if source != "CCNL":
-        st.session_state.messages.append({"role": "assistant", "content": "Per lo **straordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
-        st.rerun()
-
-    public_ans = straordinari_ipzs_public_answer(user_input, public_pages)
-
+    public_ans = straordinari_public_answer(user_input, public_pages)
     payload = {"role": "assistant", "content": public_ans}
     if st.session_state.is_admin:
-        payload["debug"] = {
-            "topic": topic,
-            "queries": queries,
-            "confidence": confidence,
-            "evidence": key_evidence,
-            "filtered_parte_sesta": True,
-        }
-
+        payload["debug"] = {"topic": topic, "model": "deterministico", "confidence": confidence}
     st.session_state.last_topic = topic
     st.session_state.messages.append(payload)
     st.rerun()
-
 
 elif topic == "notturno_ordinario":
-    # ✅ Guardrail deterministico (UILCOM): lavoro notturno ORDINARIO = 26%
-    # Nota: NON è straordinario. Lo straordinario notturno resta nel topic "straordinari".
-    if source != "CCNL":
-        st.session_state.messages.append({"role": "assistant", "content": "Per il **lavoro notturno ordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
-        st.rerun()
-
-    # ✅ Fix: tenta fullscan per ottenere pagine di citazione più accurate.
-    pages_for_cit = public_pages if public_pages else []
-    if not pages_for_cit:
-        _scan_chunks = fullscan_notturno_ordinario(meta)
-        pages_for_cit = unique_pages(_scan_chunks, max_pages=8)
-    if not pages_for_cit:
-        pages_for_cit = unique_pages(selected, max_pages=8)
-
+    pages_for_cit = public_pages or unique_pages(fullscan_notturno_ordinario(meta), 8) or unique_pages(selected, 8)
     public_ans = (
-        "Il **lavoro notturno ordinario** (cioè svolto nell’ambito dell’orario normale, **non** come straordinario) "
+        "Il **lavoro notturno ordinario** (nell'ambito dell'orario normale, **non** straordinario) "
         "è compensato con una **maggiorazione del 26%** sulla retribuzione.\n\n"
-        "Se invece la prestazione notturna è resa **in straordinario**, si applicano le regole dello **straordinario notturno**."
+        "Se la prestazione notturna è resa **in straordinario**, si applicano le regole dello **straordinario notturno**."
+        + "\n\n" + format_public_citations("CCNL", pages_for_cit)
     )
-
-    public_ans = public_ans.strip() + "\n\n" + format_public_citations("CCNL", pages_for_cit)
-
     payload = {"role": "assistant", "content": public_ans}
-
     if st.session_state.is_admin:
-        payload["debug"] = {
-            "topic": topic,
-            "deterministic_notturno_ordinario": True,
-            "percentuale": "26%",
-            "pages": pages_for_cit,
-            "queries": queries,
-            "confidence": confidence,
-            "evidence": key_evidence,
-        }
-
+        payload["debug"] = {"topic": topic, "model": "deterministico", "percentuale": "26%", "confidence": confidence}
     st.session_state.last_topic = topic
     st.session_state.messages.append(payload)
     st.rerun()
 
+elif topic == "ferie":
+    payload = {"role": "assistant", "content": ferie_public_answer(public_pages)}
+    if st.session_state.is_admin:
+        payload["debug"] = {"topic": topic, "model": "deterministico", "confidence": confidence}
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+elif topic == "tfr":
+    payload = {"role": "assistant", "content": tfr_public_answer(public_pages)}
+    if st.session_state.is_admin:
+        payload["debug"] = {"topic": topic, "model": "deterministico", "confidence": confidence}
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+elif topic == "maternita":
+    payload = {"role": "assistant", "content": maternita_public_answer(public_pages)}
+    if st.session_state.is_admin:
+        payload["debug"] = {"topic": topic, "model": "deterministico", "confidence": confidence}
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+elif topic == "preavviso":
+    payload = {"role": "assistant", "content": preavviso_public_answer(public_pages)}
+    if st.session_state.is_admin:
+        payload["debug"] = {"topic": topic, "model": "deterministico", "confidence": confidence}
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
+
+elif topic == "congedo_matrimoniale":
+    if not retrieval_ok:
+        # Retrieval debole: usa guardrail parziale hardcoded
+        payload = {"role": "assistant", "content": congedo_matrimoniale_public_answer(public_pages)}
+        if st.session_state.is_admin:
+            payload["debug"] = {"topic": topic, "model": "deterministico_fallback", "confidence": confidence}
+        st.session_state.last_topic = topic
+        st.session_state.messages.append(payload)
+        st.rerun()
+    # else: retrieval ok → cade nel blocco LLM
 
 elif topic == "permessi":
-    # ✅ Permessi/giustificativi: se l'utente chiede l'elenco completo, lo restituiamo in modo deterministico.
     if source != "IPZS":
-        st.session_state.messages.append({"role": "assistant", "content": "Per i **permessi/giustificativi IPZS** consulto le **schede IPZS**. Indicizza IPZS (permessi) e riprova."})
+        st.session_state.messages.append({"role": "assistant", "content": "Per i **permessi IPZS** consulto le schede IPZS. Indicizza IPZS e riprova."})
         st.rerun()
-
     if is_lista_permessi_question(user_input):
         titles = extract_ipzs_permessi_titles_from_file(IPZS_TXT_PATH)
-        if titles:
-            elenco = "\n".join([f"- {t}" for t in titles])
-            public_ans = (
-                "Ecco l’**elenco completo dei permessi/giustificativi** presenti nelle schede IPZS:\n\n"
-                f"{elenco}\n\n"
-                "**Fonte:** IPZS Permessi"
-            )
-        else:
-            public_ans = "Non riesco a leggere l’elenco dal file IPZS (controlla che il TXT sia presente in /documenti)."
-
+        elenco = "\n".join([f"- {t}" for t in titles]) if titles else "(nessun titolo trovato)"
+        public_ans = (
+            "Ecco l'**elenco completo dei permessi/giustificativi** presenti nelle schede IPZS:\n\n"
+            f"{elenco}\n\n**Fonte:** IPZS Permessi"
+        )
         payload = {"role": "assistant", "content": public_ans}
         if st.session_state.is_admin:
-            payload["debug"] = {"topic": topic, "deterministic_lista_permessi": True, "count": len(titles) if titles else 0}
-
+            payload["debug"] = {"topic": topic, "model": "deterministico", "count": len(titles) if titles else 0}
         st.session_state.last_topic = topic
         st.session_state.messages.append(payload)
         st.rerun()
-
-
-# ============================================================
+    # permessi specifici → LLM
 
 else:
-    # topic in ('malattia', 'rol_exfest', 'altro') → gestito dal blocco LLM
-    pass
+    pass  # malattia, rol_exfest, altro → LLM
 
-# LLM per gli altri topic
+
 # ============================================================
-# ✅ Fix: safety guard — i topic deterministici hanno già chiamato st.rerun().
-if topic in ("mansioni", "straordinari", "notturno_ordinario"):
+# SAFETY GUARD
+# ============================================================
+DETERMINISTICI = {"mansioni", "straordinari", "notturno_ordinario", "ferie", "tfr", "maternita", "preavviso"}
+if topic in DETERMINISTICI:
     st.stop()
 
-if not retrieval_ok:
-    # ✅ Fix: per permessi/malattia/rol_exfest/altro proviamo comunque il LLM con il contesto disponibile.
-    # Il hard-block viene applicato solo se non ci sono proprio chunk selezionati.
-    if len(selected) == 0:
-        payload = {"role": "assistant", "content": hard_not_found_message()}
-        if st.session_state.is_admin:
-            payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence, "evidence": key_evidence}
-        st.session_state.last_topic = topic
-        st.session_state.messages.append(payload)
-        st.rerun()
+
+# ============================================================
+# BLOCCO LLM
+# ============================================================
+if len(selected) == 0:
+    payload = {"role": "assistant", "content": hard_not_found_message()}
+    if st.session_state.is_admin:
+        payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence}
+    st.session_state.last_topic = topic
+    st.session_state.messages.append(payload)
+    st.rerun()
 
 context = "\n\n---\n\n".join(
-    [f"[{'Scheda' if source=='IPZS' else 'Pagina'} {c.get('page','?')}] {c.get('text','')}" for c in selected]
+    [f"[{'Scheda' if source == 'IPZS' else 'Pagina'} {c.get('page', '?')}] {c.get('text', '')}" for c in selected]
 )
-evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta automaticamente.)"
+evidence_block = "\n".join([f"- {e}" for e in key_evidence]) if key_evidence else "- (Nessuna evidenza estratta.)"
 
 guardrail_notturno = ""
-if is_lavoro_notturno_question(enriched_q):
-    guardrail_notturno = "GUARDRAIL NOTTURNO: domanda su lavoro notturno ordinario. NON usare percentuali straordinario notturno.\n"
-elif is_straordinario_notturno_question(enriched_q):
-    guardrail_notturno = "GUARDRAIL STRAORD. NOTTURNO: domanda su straordinario notturno. Usa SOLO le percentuali relative allo straordinario notturno.\n"
+if topic == "notturno_ordinario":
+    guardrail_notturno = "GUARDRAIL: lavoro notturno ORDINARIO. NON usare percentuali straordinario notturno.\n"
+elif topic == "straordinari" and "notturn" in enriched_q.lower():
+    guardrail_notturno = "GUARDRAIL: straordinario notturno. Usa SOLO percentuali straordinario notturno.\n"
 
-llm = ChatOpenAI(model=LLM_MODEL, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
+# MIGLIORAMENTO 4: scegli modello
+model_to_use = choose_model(user_input)
+llm = ChatOpenAI(model=model_to_use, temperature=LLM_TEMPERATURE, api_key=OPENAI_API_KEY)
 
-prompt_public = f"""
-{RULES_PUBLIC}
+# MIGLIORAMENTO 7: risposta strutturata JSON
+prompt_public = f"""{RULES_PUBLIC}
 
 SORGENTE ATTIVA: {source}
+TOPIC: {topic}
 {guardrail_notturno}
-
-DOMANDA (UTENTE):
+DOMANDA UTENTE:
 {user_input}
 
-DOMANDA ARRICCHITA (MEMORIA BREVE - solo stesso topic):
+DOMANDA CON CONTESTO CONVERSAZIONE:
 {enriched_q}
 
-EVIDENZE:
+EVIDENZE CHIAVE:
 {evidence_block}
 
-CONTESTO:
+CONTESTO DOCUMENTI:
 {context}
-
-RICORDA:
-- Chiudi SEMPRE con una riga "Fonte: ..." coerente con la sorgente.
 """
 
 try:
-    public_raw = llm.invoke(prompt_public).content
-except Exception as e:
-    public_raw = f"Errore nel generare la risposta: {e}"
+    raw_response = llm.invoke(prompt_public).content
+    clean = re.sub(r"```json|```", "", raw_response).strip()
+    parsed = json.loads(clean)
+    risposta   = (parsed.get("risposta") or "").strip()
+    fonte      = (parsed.get("fonte") or "").strip()
+    confidenza = (parsed.get("confidenza") or "media").strip()
+    avvertenza = (parsed.get("avvertenza") or "").strip()
 
-if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
-    public_raw = (public_raw or "").rstrip() + "\n\n" + public_cit_line
+    public_raw = risposta
+    if fonte and "fonte" not in risposta.lower():
+        public_raw += f"\n\n**Fonte:** {fonte}"
+    elif not fonte and public_cit_line:
+        public_raw += f"\n\n{public_cit_line}"
+    if avvertenza:
+        public_raw += f"\n\n⚠️ *{avvertenza}*"
+
+    confidenza_emoji = {"alta": "🟢", "media": "🟡", "bassa": "🔴"}.get(confidenza, "🟡")
+
+except Exception:
+    public_raw = raw_response if "raw_response" in dir() and raw_response else hard_not_found_message()
+    if not re.search(r"\bfonte\b\s*:", (public_raw or ""), flags=re.IGNORECASE):
+        public_raw = (public_raw or "").rstrip() + "\n\n" + public_cit_line
+    confidenza, confidenza_emoji = "bassa", "🔴"
+
+public_raw = (public_raw or "").strip()
+
+payload_llm: Dict[str, Any] = {"role": "assistant", "content": public_raw}
+if st.session_state.is_admin:
+    payload_llm["debug"] = {
+        "topic": topic,
+        "model": model_to_use,
+        "confidenza": f"{confidenza_emoji} {confidenza}",
+        "queries": queries,
+        "confidence_retrieval": confidence,
+        "retrieval_ok": retrieval_ok,
+        "cross_encoder": CE_AVAILABLE,
+        "evidence": key_evidence,
+    }
 
 st.session_state.last_topic = topic
-st.session_state.messages.append({"role": "assistant", "content": (public_raw or "").strip()})
+st.session_state.messages.append(payload_llm)
 st.rerun()
-
-
