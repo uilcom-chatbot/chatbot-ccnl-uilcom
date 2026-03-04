@@ -304,6 +304,7 @@ PERMESSI_TRIGGERS = [
     "riposi annui",
     "riposo annuo",
     "riposo annuo (rao)",
+    "congedo matrimoniale", "congedo",
 ]
 
 ROL_EXFEST_TRIGGERS = [
@@ -370,6 +371,11 @@ def is_notturno_ordinario_question(q: str) -> bool:
 is_lavoro_notturno_question = is_notturno_ordinario_question
 
 
+def is_congedo_matrimoniale_question(q: str) -> bool:
+    ql = q.lower()
+    return "congedo matrimoniale" in ql or ("matrimon" in ql) or ("nozze" in ql)
+
+
 def detect_topic(q: str) -> str:
     ql = q.lower()
     if is_malattia_question(ql):
@@ -378,6 +384,9 @@ def detect_topic(q: str) -> str:
         return "mansioni"
     if is_rol_exfest_question(ql):
         return "rol_exfest"
+    # ✅ Fix: congedo matrimoniale sta nel CCNL, non in IPZS — intercettarlo PRIMA di permessi
+    if is_congedo_matrimoniale_question(ql):
+        return "congedo_matrimoniale"
     if is_permessi_question(ql):
         return "permessi"
     # ✅ prima intercettiamo il notturno ordinario
@@ -429,6 +438,20 @@ def build_queries(q: str) -> List[str]:
             "permesso studio una settimana l'anno",
             "donazione sangue permesso retribuito",
             "legge 104 art 33 comma 3 permesso",
+        ]
+        # ✅ Fix: query specifiche per matrimonio/congedo matrimoniale
+        if any(x in q0.lower() for x in ["matrimon", "nozze", "congedo"]):
+            qs += [
+                "congedo matrimoniale giorni retribuiti",
+                "matrimonio permesso retribuito giorni",
+                "permesso matrimonio nozze CCNL IPZS",
+            ]
+
+    if topic == "congedo_matrimoniale" or is_congedo_matrimoniale_question(q0):
+        qs += [
+            "congedo matrimoniale giorni retribuiti CCNL",
+            "matrimonio permesso retribuito giorni lavorativi",
+            "congedo matrimoniale grafici editoria",
         ]
     if is_malattia_question(q0):
         qs += [
@@ -577,7 +600,13 @@ def mansioni_public_answer(user_q: str, rules: Dict[str, Any]) -> str:
                 "- **60 giorni complessivi**, anche non continuativi."
             )
         else:
-            parts.append("Non ho trovato nei documenti caricati la regola 30/60 giorni sulla definitività (nel materiale recuperato).")
+            # ✅ Fix: anche senza conferma dal retrieval, la regola 30/60 è nota e hardcoded.
+            parts.append(
+                "La categoria/livello superiore **matura** (diventa definitivo) dopo:\n"
+                "- **30 giorni consecutivi** di mansioni superiori;\n"
+                "- **60 giorni complessivi**, anche non continuativi.\n\n"
+                "*(Regola da CCNL — verifica la pagina esatta nella tua copia del contratto.)*"
+            )
 
         if rules.get("has_esclusione", False):
             parts.append(
@@ -935,6 +964,9 @@ if "straordin" in (user_input or "").lower():
 enriched_q = build_enriched_question(user_input, topic)
 
 use_ipzs = topic in ("permessi", "rol_exfest")
+# ✅ Fix: congedo_matrimoniale usa CCNL anche se ha trigger simili ai permessi
+if topic == "congedo_matrimoniale":
+    use_ipzs = False
 source = "IPZS" if use_ipzs else "CCNL"
 
 if source == "CCNL":
@@ -1073,8 +1105,9 @@ if topic == "mansioni":
 
         public_ans = mansioni_public_answer(user_input, rules_m)
     else:
-        # ✅ Fallback deterministico: per la differenza paga su mansioni superiori non blocchiamo la risposta.
-        rules_m = {"has_trattamento": True, "found_30": False, "found_60": False, "has_esclusione": False, "has_formazione": False, "pages": public_pages}
+        # ✅ Fallback deterministico: retrieval debole ma la regola 30/60 è nota,
+        # impostiamo tutti i flag a True per restituire la risposta hardcoded completa.
+        rules_m = {"has_trattamento": True, "found_30": True, "found_60": True, "has_esclusione": False, "has_formazione": False, "pages": public_pages}
         public_ans = mansioni_public_answer(user_input, rules_m)
 
     payload = {"role": "assistant", "content": public_ans}
@@ -1195,12 +1228,15 @@ if topic in ("mansioni", "straordinari", "notturno_ordinario"):
     st.stop()
 
 if not retrieval_ok:
-    payload = {"role": "assistant", "content": hard_not_found_message()}
-    if st.session_state.is_admin:
-        payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence, "evidence": key_evidence}
-    st.session_state.last_topic = topic
-    st.session_state.messages.append(payload)
-    st.rerun()
+    # ✅ Fix: per permessi/malattia/rol_exfest/altro proviamo comunque il LLM con il contesto disponibile.
+    # Il hard-block viene applicato solo se non ci sono proprio chunk selezionati.
+    if len(selected) == 0:
+        payload = {"role": "assistant", "content": hard_not_found_message()}
+        if st.session_state.is_admin:
+            payload["debug"] = {"topic": topic, "queries": queries, "confidence": confidence, "evidence": key_evidence}
+        st.session_state.last_topic = topic
+        st.session_state.messages.append(payload)
+        st.rerun()
 
 context = "\n\n---\n\n".join(
     [f"[{'Scheda' if source=='IPZS' else 'Pagina'} {c.get('page','?')}] {c.get('text','')}" for c in selected]
