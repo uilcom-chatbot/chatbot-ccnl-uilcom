@@ -360,15 +360,14 @@ def is_straordinario_notturno_question(q: str) -> bool:
     return ("straordin" in ql) and ("notturn" in ql)
 
 
-def is_lavoro_notturno_question(q: str) -> bool:
-    ql = q.lower()
-    return ("notturn" in ql) and ("straordin" not in ql)
-
-
 def is_notturno_ordinario_question(q: str) -> bool:
     ql = q.lower()
     # NOTTURNO ORDINARIO: parla di notturno ma NON di straordinario
     return ("notturn" in ql) and ("straordin" not in ql)
+
+
+# Alias per retrocompatibilità (stessa logica)
+is_lavoro_notturno_question = is_notturno_ordinario_question
 
 
 def detect_topic(q: str) -> str:
@@ -616,7 +615,7 @@ def straordinari_ipzs_public_answer(user_q: str, cc_pages: List[int]) -> str:
     lines.append("Per lo **straordinario** (CCNL Grafici-Editoriali), le maggiorazioni sono in genere così articolate:")
 
     if "ferial" in ql and "festiv" not in ql and "notturn" not in ql:
-        lines.append("- **Straordinario feriale:** **60%**")
+        lines.append("- **Straordinario feriale (diurno):** **35%**")
     else:
         lines.append("- **Straordinario diurno:** **35%**")
         lines.append("- **Straordinario notturno:** **60%**")
@@ -996,7 +995,13 @@ for c, s in zip(candidates, cand_scores):
 
 selected = _dedup_near_identical(tmp[:TOP_K_FINAL])
 selected_scores = tmp_scores[: len(selected)]
+
+# ✅ Fix: dopo bm25_rerank, riallinea i punteggi all'ordine effettivo
+_selected_pre_bm25 = list(selected)
 selected = bm25_rerank(enriched_q, selected)
+# ricostruisce selected_scores nell'ordine post-BM25
+_score_map = {id(c): s for c, s in zip(_selected_pre_bm25, selected_scores)}
+selected_scores = [_score_map.get(id(c), 0.0) for c in selected]
 
 confidence = compute_retrieval_confidence(selected_scores)
 retrieval_ok = (
@@ -1087,7 +1092,7 @@ if topic == "mansioni":
     st.rerun()
 
 
-if topic == "straordinari":
+elif topic == "straordinari":
     if source != "CCNL":
         st.session_state.messages.append({"role": "assistant", "content": "Per lo **straordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
         st.rerun()
@@ -1109,15 +1114,20 @@ if topic == "straordinari":
     st.rerun()
 
 
-if topic == "notturno_ordinario":
+elif topic == "notturno_ordinario":
     # ✅ Guardrail deterministico (UILCOM): lavoro notturno ORDINARIO = 26%
     # Nota: NON è straordinario. Lo straordinario notturno resta nel topic "straordinari".
     if source != "CCNL":
         st.session_state.messages.append({"role": "assistant", "content": "Per il **lavoro notturno ordinario** consulto il **CCNL**. Indicizza il CCNL e riprova."})
         st.rerun()
 
-    # Proviamo comunque a recuperare pagine utili per citazione, ma la risposta non dipende dal retrieval.
-    pages_for_cit = public_pages if public_pages else unique_pages(selected, max_pages=8)
+    # ✅ Fix: tenta fullscan per ottenere pagine di citazione più accurate.
+    pages_for_cit = public_pages if public_pages else []
+    if not pages_for_cit:
+        _scan_chunks = fullscan_notturno_ordinario(meta)
+        pages_for_cit = unique_pages(_scan_chunks, max_pages=8)
+    if not pages_for_cit:
+        pages_for_cit = unique_pages(selected, max_pages=8)
 
     public_ans = (
         "Il **lavoro notturno ordinario** (cioè svolto nell’ambito dell’orario normale, **non** come straordinario) "
@@ -1145,7 +1155,7 @@ if topic == "notturno_ordinario":
     st.rerun()
 
 
-if topic == "permessi":
+elif topic == "permessi":
     # ✅ Permessi/giustificativi: se l'utente chiede l'elenco completo, lo restituiamo in modo deterministico.
     if source != "IPZS":
         st.session_state.messages.append({"role": "assistant", "content": "Per i **permessi/giustificativi IPZS** consulto le **schede IPZS**. Indicizza IPZS (permessi) e riprova."})
@@ -1173,8 +1183,17 @@ if topic == "permessi":
 
 
 # ============================================================
+
+else:
+    # topic in ('malattia', 'rol_exfest', 'altro') → gestito dal blocco LLM
+    pass
+
 # LLM per gli altri topic
 # ============================================================
+# ✅ Fix: safety guard — i topic deterministici hanno già chiamato st.rerun().
+if topic in ("mansioni", "straordinari", "notturno_ordinario"):
+    st.stop()
+
 if not retrieval_ok:
     payload = {"role": "assistant", "content": hard_not_found_message()}
     if st.session_state.is_admin:
