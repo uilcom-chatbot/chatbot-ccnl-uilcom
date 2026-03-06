@@ -124,6 +124,50 @@ st.divider()
 
 
 # ============================================================
+# AUTO-INDICIZZAZIONE (funzioni riutilizzate anche dalla sidebar admin)
+# ============================================================
+def _run_index_ccnl() -> str:
+    """Indicizza il CCNL. Ritorna messaggio di esito."""
+    if not os.path.exists(PDF_PATH):
+        raise FileNotFoundError(f"File non trovato: {PDF_PATH} — metti ccnl.pdf nella cartella /documenti")
+    os.makedirs(INDEX_DIR, exist_ok=True)
+    loader = PyPDFLoader(PDF_PATH)
+    docs = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    chunks = splitter.split_documents(docs)
+    texts = [c.page_content for c in chunks]
+    pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]
+    emb_idx = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+    vectors = np.array(emb_idx.embed_documents(texts), dtype=np.float32)
+    np.save(VEC_PATH, vectors)
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
+    return f"CCNL indicizzato: {len(chunks)} chunk"
+
+
+def _run_index_ipzs() -> str:
+    """Indicizza le schede IPZS. Ritorna messaggio di esito."""
+    if not os.path.exists(IPZS_TXT_PATH):
+        raise FileNotFoundError(f"File non trovato: {IPZS_TXT_PATH} — metti il TXT nella cartella /documenti")
+    os.makedirs(INDEX_DIR_IPZS, exist_ok=True)
+    with open(IPZS_TXT_PATH, "r", encoding="utf-8") as f:
+        raw_txt = f.read()
+    blocks = split_ipzs_blocks(raw_txt)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=IPZS_CHUNK_SIZE, chunk_overlap=IPZS_CHUNK_OVERLAP)
+    chunks_ipzs: List[Dict[str, Any]] = []
+    for scheda, b in enumerate(blocks, 1):
+        for p in splitter.split_text(b):
+            chunks_ipzs.append({"page": scheda, "text": p})
+    texts_ipzs = [c["text"] for c in chunks_ipzs]
+    emb_idx = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
+    vectors_ipzs = np.array(emb_idx.embed_documents(texts_ipzs), dtype=np.float32)
+    np.save(VEC_PATH_IPZS, vectors_ipzs)
+    with open(META_PATH_IPZS, "w", encoding="utf-8") as f:
+        json.dump(chunks_ipzs, f, ensure_ascii=False)
+    return f"IPZS indicizzato: {len(blocks)} schede, {len(chunks_ipzs)} chunk"
+
+
+# ============================================================
 # AUTH: ISCRITTI
 # ============================================================
 if "auth_ok" not in st.session_state:
@@ -144,6 +188,53 @@ else:
 
 if not st.session_state.auth_ok:
     st.stop()
+
+
+# ============================================================
+# AUTO-INDICIZZAZIONE AL PRIMO ACCESSO
+# Se i documenti esistono ma l'indice no, indicizza automaticamente.
+# L'utente vede una progress bar e non deve fare nulla.
+# ============================================================
+if "auto_index_done" not in st.session_state:
+    st.session_state.auto_index_done = False
+
+if not st.session_state.auto_index_done:
+    needs_ccnl  = not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH))
+    needs_ipzs  = not (os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS))
+    has_ccnl_src = os.path.exists(PDF_PATH)
+    has_ipzs_src = os.path.exists(IPZS_TXT_PATH)
+
+    if (needs_ccnl and has_ccnl_src) or (needs_ipzs and has_ipzs_src):
+        st.info("⏳ Primo accesso: indicizzazione documenti in corso. Attendi qualche secondo...")
+        progress = st.progress(0, text="Avvio indicizzazione...")
+
+        if needs_ccnl and has_ccnl_src:
+            progress.progress(10, text="Indicizzazione CCNL in corso...")
+            try:
+                msg = _run_index_ccnl()
+                progress.progress(55, text=f"✅ {msg}")
+            except Exception as e:
+                st.warning(f"⚠️ Indicizzazione CCNL fallita: {e}")
+                progress.progress(55, text="CCNL: errore (vedi avviso)")
+        else:
+            progress.progress(55, text="CCNL già indicizzato ✅")
+
+        if needs_ipzs and has_ipzs_src:
+            progress.progress(60, text="Indicizzazione IPZS in corso...")
+            try:
+                msg = _run_index_ipzs()
+                progress.progress(100, text=f"✅ {msg}")
+            except Exception as e:
+                st.warning(f"⚠️ Indicizzazione IPZS fallita: {e}")
+                progress.progress(100, text="IPZS: errore (vedi avviso)")
+        else:
+            progress.progress(100, text="IPZS già indicizzato ✅")
+
+        st.session_state.auto_index_done = True
+        st.rerun()
+    else:
+        # Indici già presenti o documenti sorgente mancanti: nessuna azione
+        st.session_state.auto_index_done = True
 
 
 # ============================================================
@@ -845,61 +936,37 @@ with st.sidebar:
         st.caption("ADMIN_PASSWORD non impostata.")
 
     st.divider()
-    st.subheader("📦 Indice CCNL")
+    st.subheader("📦 Stato indici")
     ok_index = os.path.exists(VEC_PATH) and os.path.exists(META_PATH)
-    st.write("Indice presente:", "✅" if ok_index else "❌")
+    ok_ipzs  = os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)
+    st.write("Indice CCNL:", "✅ pronto" if ok_index else "❌ mancante")
+    st.write("Indice IPZS:", "✅ pronto" if ok_ipzs  else "❌ mancante")
 
-    if st.button("Indicizza / Reindicizza CCNL", use_container_width=True):
-        try:
-            with st.spinner("Indicizzazione CCNL in corso..."):
-                if not os.path.exists(PDF_PATH):
-                    raise FileNotFoundError(f"Non trovo il PDF: {PDF_PATH}")
-                os.makedirs(INDEX_DIR, exist_ok=True)
-                loader = PyPDFLoader(PDF_PATH)
-                docs = loader.load()
-                splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-                chunks = splitter.split_documents(docs)
-                texts = [c.page_content for c in chunks]
-                pages = [(int(c.metadata.get("page", 0)) + 1) for c in chunks]
-                emb_idx = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors = np.array(emb_idx.embed_documents(texts), dtype=np.float32)
-                np.save(VEC_PATH, vectors)
-                with open(META_PATH, "w", encoding="utf-8") as f:
-                    json.dump([{"page": p, "text": t} for p, t in zip(pages, texts)], f, ensure_ascii=False)
-            st.success(f"Indicizzazione CCNL completata. Chunk: {len(chunks)}")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
+    # Pulsanti di reindicizzazione manuale: SOLO ADMIN
+    if st.session_state.is_admin:
+        st.divider()
+        st.caption("🔧 Strumenti admin — reindicizzazione manuale")
+        if st.button("🔄 Reindicizza CCNL", use_container_width=True):
+            try:
+                with st.spinner("Reindicizzazione CCNL in corso..."):
+                    msg = _run_index_ccnl()
+                st.success(msg)
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
-    st.divider()
-    st.subheader("📦 Indice IPZS (permessi)")
-    ok_ipzs = os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)
-    st.write("Indice IPZS presente:", "✅" if ok_ipzs else "❌")
+        if st.button("🔄 Reindicizza IPZS", use_container_width=True):
+            try:
+                with st.spinner("Reindicizzazione IPZS in corso..."):
+                    msg = _run_index_ipzs()
+                st.success(msg)
+                st.rerun()
+            except Exception as e:
+                st.error(str(e))
 
-    if st.button("Indicizza / Reindicizza IPZS (permessi)", use_container_width=True):
-        try:
-            with st.spinner("Indicizzazione IPZS in corso..."):
-                if not os.path.exists(IPZS_TXT_PATH):
-                    raise FileNotFoundError(f"Non trovo il file: {IPZS_TXT_PATH}")
-                os.makedirs(INDEX_DIR_IPZS, exist_ok=True)
-                with open(IPZS_TXT_PATH, "r", encoding="utf-8") as f:
-                    raw_txt = f.read()
-                blocks = split_ipzs_blocks(raw_txt)
-                splitter = RecursiveCharacterTextSplitter(chunk_size=IPZS_CHUNK_SIZE, chunk_overlap=IPZS_CHUNK_OVERLAP)
-                chunks_ipzs: List[Dict[str, Any]] = []
-                for scheda, b in enumerate(blocks, 1):
-                    for p in splitter.split_text(b):
-                        chunks_ipzs.append({"page": scheda, "text": p})
-                texts_ipzs = [c["text"] for c in chunks_ipzs]
-                emb_idx = OpenAIEmbeddings(api_key=OPENAI_API_KEY)
-                vectors_ipzs = np.array(emb_idx.embed_documents(texts_ipzs), dtype=np.float32)
-                np.save(VEC_PATH_IPZS, vectors_ipzs)
-                with open(META_PATH_IPZS, "w", encoding="utf-8") as f:
-                    json.dump(chunks_ipzs, f, ensure_ascii=False)
-            st.success(f"Indicizzazione IPZS completata. Schede: {len(blocks)} — Chunk: {len(chunks_ipzs)}")
-            st.rerun()
-        except Exception as e:
-            st.error(str(e))
+        if st.button("🗑️ Reset auto-index (forza rindexing al prossimo login)", use_container_width=True):
+            st.session_state.auto_index_done = False
+            st.success("Reset eseguito. Al prossimo accesso verrà reindicizzato automaticamente.")
 
     st.divider()
     if st.button("🧹 Nuova chat", use_container_width=True):
@@ -959,11 +1026,11 @@ source = topic_to_source(topic)
 # ============================================================
 if source == "CCNL":
     if not (os.path.exists(VEC_PATH) and os.path.exists(META_PATH)):
-        st.session_state.messages.append({"role": "assistant", "content": "Prima devo indicizzare il CCNL: apri la barra laterale e clicca **Indicizza / Reindicizza CCNL**."})
+        st.session_state.messages.append({"role": "assistant", "content": "⏳ L'indice CCNL non è ancora pronto. Ricarica la pagina — verrà indicizzato automaticamente se il file è presente."})
         st.rerun()
 else:
     if not (os.path.exists(VEC_PATH_IPZS) and os.path.exists(META_PATH_IPZS)):
-        st.session_state.messages.append({"role": "assistant", "content": "Prima devo indicizzare le **schede IPZS**: apri la barra laterale e clicca **Indicizza / Reindicizza IPZS (permessi)**."})
+        st.session_state.messages.append({"role": "assistant", "content": "⏳ L'indice IPZS non è ancora pronto. Ricarica la pagina — verrà indicizzato automaticamente se il file è presente."})
         st.rerun()
 
 
@@ -1132,7 +1199,7 @@ elif topic == "congedo_matrimoniale":
 
 elif topic == "permessi":
     if source != "IPZS":
-        st.session_state.messages.append({"role": "assistant", "content": "Per i **permessi IPZS** consulto le schede IPZS. Indicizza IPZS e riprova."})
+        st.session_state.messages.append({"role": "assistant", "content": "⏳ Per i **permessi IPZS** serve l'indice IPZS. Ricarica la pagina per indicizzare automaticamente."})
         st.rerun()
     if is_lista_permessi_question(user_input):
         titles = extract_ipzs_permessi_titles_from_file(IPZS_TXT_PATH)
